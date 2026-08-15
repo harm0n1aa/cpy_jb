@@ -1,0 +1,26 @@
+# Upstream clone metadata kept locally, not published
+.ioscpy-upstream.git/
+
+# Rust / host
+**/target/
+**/*.rs.bk
+
+# Theos / device build artifacts
+**/.theos/
+**/obj/
+**/packages/
+**/*.deb
+
+# OS / editor
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
+
+# Secrets
+*.pem
+id_rsa*
+*.token
+secrets.env
+.env
