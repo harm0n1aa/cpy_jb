@@ -104,11 +104,27 @@ static BOOL injectDlopen(pid_t pid, const char *dylib) {
 
     arm_thread_state64_t st;
     memset(&st, 0, sizeof(st));
-    st.__pc = dlopenRemote;
-    st.__lr = pthreadExitRemote ? pthreadExitRemote : dlopenRemote;
-    st.__sp = (remoteStack + stackSize - 0x20) & ~(vm_address_t)0xF;
+    vm_address_t sp = (remoteStack + stackSize - 0x20) & ~(vm_address_t)0xF;
+    uint64_t lr = pthreadExitRemote ? pthreadExitRemote : dlopenRemote;
+#if defined(__darwin_arm_thread_state64_set_pc_fptr)
+    // Xcode opaque arm64e thread state (no direct __pc / __lr / __sp).
+    __darwin_arm_thread_state64_set_pc_fptr(st, (void *)(uintptr_t)dlopenRemote);
+    __darwin_arm_thread_state64_set_lr_fptr(st, (void *)(uintptr_t)lr);
+    __darwin_arm_thread_state64_set_sp(st, sp);
+#if defined(__darwin_arm_thread_state64_set_x)
+    __darwin_arm_thread_state64_set_x(st, 0, remotePath);
+    __darwin_arm_thread_state64_set_x(st, 1, (uint64_t)RTLD_NOW);
+#else
     st.__x[0] = remotePath;
     st.__x[1] = RTLD_NOW;
+#endif
+#else
+    st.__pc = dlopenRemote;
+    st.__lr = lr;
+    st.__sp = sp;
+    st.__x[0] = remotePath;
+    st.__x[1] = RTLD_NOW;
+#endif
 
     thread_act_t thread = MACH_PORT_NULL;
     kr = thread_create_running(task, ARM_THREAD_STATE64, (thread_state_t)&st, ARM_THREAD_STATE64_COUNT,

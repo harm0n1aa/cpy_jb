@@ -1,4 +1,6 @@
 TARGET = iphone:clang:latest:14.0
+# Local/QEMU: arm64 only. GitHub macOS CI passes ARCHS="arm64 arm64e" so ElleKit
+# can load the hook into arm64e SpringBoard (iPhone 12+).
 ARCHS = arm64
 INSTALL_TARGET_PROCESSES = SpringBoard
 

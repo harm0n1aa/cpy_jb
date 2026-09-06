@@ -1,5 +1,7 @@
 TARGET = iphone:clang:latest:14.0
-ARCHS = arm64
+# Daemon is its own process; arm64 is enough. Keep arm64e off so Xcode PAC
+# thread-state headers do not break the build when CI builds the tweak fat.
+override ARCHS = arm64
 
 include $(THEOS)/makefiles/common.mk
 
