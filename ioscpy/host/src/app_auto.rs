@@ -283,12 +283,10 @@ fn pump_live(ctx: &egui::Context, live: &mut Live, profile: &mut String) {
         } else if kind == MessageType::UiDumpResult {
             if let Some(dump) = Dump::parse(&payload) {
                 let profiles = dump.profiles();
-                if dump.is_container() {
-                    if !profiles.is_empty() {
-                        live.profiles = profiles;
-                        if profile.is_empty() && !live.profiles.is_empty() {
-                            *profile = live.profiles[0].clone();
-                        }
+                if !profiles.is_empty() {
+                    live.profiles = profiles;
+                    if profile.is_empty() {
+                        *profile = live.profiles[0].clone();
                     }
                 } else if dump.is_springboard() {
                     // Drop stale SpringBoard junk that older builds stuffed into the combo.
@@ -412,6 +410,7 @@ fn draw_panel(ui: &mut Ui, app: &mut AutoApp) {
                         .unwrap_or_default();
                     if !profiles.is_empty() {
                         egui::ComboBox::from_id_salt("profiles")
+                            .width(ui.available_width().max(180.0))
                             .selected_text(if app.profile.is_empty() {
                                 "выбрать из дампа".to_string()
                             } else {
@@ -422,8 +421,14 @@ fn draw_panel(ui: &mut Ui, app: &mut AutoApp) {
                                     ui.selectable_value(&mut app.profile, p.clone(), p);
                                 }
                             });
-                        ui.add_space(6.0);
+                    } else {
+                        ui.label(
+                            egui::RichText::new("список профилей: открой шторку → «считать UI»")
+                                .size(11.0)
+                                .color(MUTED),
+                        );
                     }
+                    ui.add_space(6.0);
                     field(ui, "Приложение", &mut app.app_name, "Деньги");
                     field(ui, "PIN экрана", &mut app.lock_pin, "956123");
                     field(ui, "PIN приложения", &mut app.app_pin, "0805");

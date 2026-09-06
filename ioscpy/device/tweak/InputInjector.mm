@@ -734,39 +734,45 @@ static void actionLock(void) {
 
 static void actionWake(void) {
     // Fully wake the panel — a single backlight poke often leaves AOD / dim lock.
-    id bl = sharedOf("SBBacklightController");
-    SEL turnOn = @selector(turnOnScreenFullyWithBacklightSource:);
-    if ([bl respondsToSelector:turnOn]) {
-        void (*fn)(id, SEL, long) = (void (*)(id, SEL, long))[bl methodForSelector:turnOn];
-        fn(bl, turnOn, 0);
-        fn(bl, turnOn, 1);
-        fn(bl, turnOn, 11);
-    } else if ([bl respondsToSelector:@selector(setBacklightFactor:source:)]) {
-        void (*fn)(id, SEL, float, long) =
-            (void (*)(id, SEL, float, long))[bl methodForSelector:@selector(setBacklightFactor:source:)];
-        fn(bl, @selector(setBacklightFactor:source:), 1.0f, 1);
-    }
-    if ([bl respondsToSelector:@selector(reloadDefaults)]) {
-        [bl performSelector:@selector(reloadDefaults)];
-    }
-
-    id idle = sharedOf("SBIdleTimerGlobalCoordinator");
-    if ([idle respondsToSelector:@selector(resetIdleTimerIfNecessary)]) {
-        [idle performSelector:@selector(resetIdleTimerIfNecessary)];
-    } else if ([idle respondsToSelector:@selector(resetIdleTimer)]) {
-        [idle performSelector:@selector(resetIdleTimer)];
-    }
-
-    id mgr = sharedOf("SBLockScreenManager");
-    if ([mgr respondsToSelector:@selector(wakeUpDeviceIfNecessary)]) {
-        [mgr performSelector:@selector(wakeUpDeviceIfNecessary)];
-    }
-
-    // Nudge UIKit so CoverSheet / passcode become interactive.
-    id app = [UIApplication sharedApplication];
-    if ([app respondsToSelector:NSSelectorFromString(@"_userEventOccurred:")]) {
-        ((void (*)(id, SEL, id))objc_msgSend)(app, NSSelectorFromString(@"_userEventOccurred:"), nil);
-    }
+    void (^burst)(void) = ^{
+        id bl = sharedOf("SBBacklightController");
+        SEL turnOn = @selector(turnOnScreenFullyWithBacklightSource:);
+        if ([bl respondsToSelector:turnOn]) {
+            void (*fn)(id, SEL, long) = (void (*)(id, SEL, long))[bl methodForSelector:turnOn];
+            fn(bl, turnOn, 0);
+            fn(bl, turnOn, 1);
+            fn(bl, turnOn, 11);
+        } else if ([bl respondsToSelector:@selector(setBacklightFactor:source:)]) {
+            void (*fn)(id, SEL, float, long) =
+                (void (*)(id, SEL, float, long))[bl methodForSelector:@selector(setBacklightFactor:source:)];
+            fn(bl, @selector(setBacklightFactor:source:), 1.0f, 1);
+        }
+        if ([bl respondsToSelector:@selector(preventIdleSleep)]) {
+            [bl performSelector:@selector(preventIdleSleep)];
+        }
+        id idle = sharedOf("SBIdleTimerGlobalCoordinator");
+        if ([idle respondsToSelector:@selector(resetIdleTimerIfNecessary)]) {
+            [idle performSelector:@selector(resetIdleTimerIfNecessary)];
+        } else if ([idle respondsToSelector:@selector(resetIdleTimer)]) {
+            [idle performSelector:@selector(resetIdleTimer)];
+        }
+        id mgr = sharedOf("SBLockScreenManager");
+        if ([mgr respondsToSelector:@selector(wakeUpDeviceIfNecessary)]) {
+            [mgr performSelector:@selector(wakeUpDeviceIfNecessary)];
+        }
+        id app = [UIApplication sharedApplication];
+        if ([app respondsToSelector:NSSelectorFromString(@"_userEventOccurred:")]) {
+            ((void (*)(id, SEL, id))objc_msgSend)(app, NSSelectorFromString(@"_userEventOccurred:"), nil);
+        }
+        if ([UIScreen.mainScreen respondsToSelector:@selector(setBrightness:)]) {
+            UIScreen.mainScreen.brightness = 1.0;
+        }
+    };
+    burst();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), burst);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.55 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), burst);
 }
 
 static void actionAppSwitcher(void) {

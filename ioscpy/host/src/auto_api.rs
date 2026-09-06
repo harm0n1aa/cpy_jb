@@ -27,6 +27,20 @@ const LOCK_PAD: [(f32, f32); 10] = [
     (0.75, 0.680),
 ];
 
+/// In-app PIN pad (Cashline / Alfa-style) — lower than the lock keypad.
+const APP_PAD: [(f32, f32); 10] = [
+    (0.50, 0.805),
+    (0.22, 0.505),
+    (0.50, 0.505),
+    (0.78, 0.505),
+    (0.22, 0.605),
+    (0.50, 0.605),
+    (0.78, 0.605),
+    (0.22, 0.705),
+    (0.50, 0.705),
+    (0.78, 0.705),
+];
+
 const LOG_CAP: usize = 120;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -135,33 +149,63 @@ impl Dump {
     }
 
     pub fn find_digit(&self, d: char) -> Option<&Node> {
-        let want = d;
         self.nodes
             .iter()
-            .filter(|n| {
-                if n.y <= 0.35 {
-                    return false;
-                }
-                first_digit(&n.text) == Some(want)
-            })
+            .filter(|n| n.y > 0.38 && n.y < 0.92 && is_pad_key(&n.text, d))
             .min_by(|a, b| {
-                // Prefer compact keys near the classic pad band.
-                let da = (a.y - 0.60).abs();
-                let db = (b.y - 0.60).abs();
-                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                let sa = pad_key_score(a, d);
+                let sb = pad_key_score(b, d);
+                sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
             })
     }
 
     pub fn has_digit_pad(&self) -> bool {
-        self.find_digit('1').is_some() && self.find_digit('0').is_some()
+        self.find_digit('1').is_some()
+            && self.find_digit('2').is_some()
+            && self.find_digit('0').is_some()
     }
 
     pub fn is_springboard(&self) -> bool {
         self.bundle == "com.apple.springboard"
     }
 
-    /// Icon / label for an app on the home screen (ignores bare bundle-id noise).
+    /// Home-screen / dock icon for the bank app.
     pub fn find_app_icon(&self, name: &str) -> Option<&Node> {
+        let n = fold(name);
+        if n.is_empty() {
+            return None;
+        }
+        let mut found: Vec<&Node> = self
+            .nodes
+            .iter()
+            .filter(|node| {
+                let f = fold(&node.text);
+                if f.is_empty() || looks_like_system_chrome(&node.text) {
+                    return false;
+                }
+                f == n
+                    || f.starts_with(&n)
+                    || (f.contains(&n) && (f.contains("cashline") || f.starts_with(&n)))
+            })
+            .collect();
+        if found.is_empty() {
+            return None;
+        }
+        // Prefer icon grid (y < 0.88) over anything in the cancel/home-indicator band.
+        found.sort_by(|a, b| {
+            let ae = (a.y > 0.88) as i32;
+            let be = (b.y > 0.88) as i32;
+            ae.cmp(&be)
+                .then_with(|| fold(&a.text).len().cmp(&fold(&b.text).len()))
+                .then_with(|| {
+                    a.h.partial_cmp(&b.h).unwrap_or(std::cmp::Ordering::Equal)
+                })
+        });
+        found.into_iter().next()
+    }
+
+    /// Row in the container profile list (never Cancel / chrome).
+    pub fn find_profile(&self, name: &str) -> Option<&Node> {
         let n = fold(name);
         if n.is_empty() {
             return None;
@@ -169,31 +213,46 @@ impl Dump {
         self.nodes
             .iter()
             .filter(|node| {
-                let f = fold(&node.text);
-                if f.is_empty() {
+                let t = node.text.trim();
+                let f = fold(t);
+                if f.is_empty() || looks_like_system_chrome(t) {
                     return false;
                 }
-                // Prefer display name; allow "Деньги com.foo" style labels.
-                f == n
-                    || f.starts_with(&n)
-                    || (f.contains(&n) && !n.contains("comapple"))
+                if f.contains("отменить") || f == "деньги" {
+                    return false;
+                }
+                // Keep taps inside the sheet list, away from Cancel (~bottom).
+                if node.y < 0.14 || node.y > 0.80 {
+                    return false;
+                }
+                if node.h > 0.22 {
+                    return false;
+                }
+                f.contains(&n)
             })
             .min_by_key(|node| {
                 let f = fold(&node.text);
-                // Prefer shorter / exact display names over "Name + bundle".
-                (f.len() as i32, (f != n) as i32)
+                let exact = if f == n { 0 } else { 1 };
+                (exact, (node.h * 1000.0) as i32, f.len())
             })
     }
 
-    /// Only when the app shows the container picker — never SpringBoard icons.
+    /// Profile names from the container sheet.
     pub fn profiles(&self) -> Vec<String> {
         if !self.is_container() {
             return Vec::new();
         }
+        self.profile_candidates()
+    }
+
+    fn profile_candidates(&self) -> Vec<String> {
         let mut out = Vec::new();
         for n in &self.nodes {
             let t = n.text.trim();
-            if t.chars().count() < 3 || n.y < 0.12 || n.y > 0.90 {
+            if t.chars().count() < 3 || n.y < 0.12 || n.y > 0.82 {
+                continue;
+            }
+            if n.h > 0.22 {
                 continue;
             }
             if looks_like_system_chrome(t) {
@@ -207,10 +266,15 @@ impl Dump {
                 || f == "деньги"
                 || f.contains("введите")
                 || f.contains("забыли")
+                || f.contains("кодпароль")
             {
                 continue;
             }
             if !t.chars().any(|c| c.is_alphabetic()) {
+                continue;
+            }
+            // Bundle ids / icon labels
+            if t.contains("com.") || f.contains("comapple") {
                 continue;
             }
             if !out.iter().any(|s: &String| s == t) {
@@ -235,7 +299,7 @@ impl Dump {
         let t = self.joined();
         t.contains("кодпароль")
             || (t.contains("отменить") && (t.contains("sos") || t.contains("экстренн")))
-            || (self.is_springboard() && self.is_pin())
+            || (self.is_springboard() && self.is_pin() && self.profile_candidates().is_empty())
             || (self.is_pin()
                 && self.nodes.iter().any(|n| {
                     let c = n.class.to_lowercase();
@@ -245,7 +309,11 @@ impl Dump {
 
     pub fn is_container(&self) -> bool {
         let t = self.joined();
-        t.contains("container") || t.contains("отменить") || t.contains("поумолчанию")
+        if t.contains("container") || t.contains("поумолчанию") {
+            return true;
+        }
+        // Sheet with Cancel + several profile rows (Cashline-style).
+        t.contains("отменить") && self.profile_candidates().len() >= 2
     }
 
     pub fn is_error(&self) -> bool {
@@ -269,6 +337,41 @@ pub fn fold(s: &str) -> String {
         .collect()
 }
 
+fn is_pad_key(text: &str, d: char) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if t == d.to_string() {
+        return true;
+    }
+    // Passcode keys: "5" / "5\nJKL" / "5 ABC" — exactly one digit, and it is `d`.
+    let digits: Vec<char> = t.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() != 1 || digits[0] != d {
+        return false;
+    }
+    // Reject long sentences that merely contain a digit.
+    t.chars().count() <= 12
+}
+
+fn pad_key_score(n: &Node, d: char) -> f32 {
+    let compact = if n.text.trim() == d.to_string() {
+        0.0
+    } else {
+        1.0
+    };
+    let class = n.class.to_lowercase();
+    let class_boost = if class.contains("passcode")
+        || class.contains("numberpad")
+        || class.contains("pin")
+    {
+        -2.0
+    } else {
+        0.0
+    };
+    compact + class_boost + (n.y - 0.62).abs() + n.w.abs()
+}
+
 fn looks_like_system_chrome(t: &str) -> bool {
     let f = fold(t);
     if f.contains("comapple") || t.contains("com.") {
@@ -287,10 +390,6 @@ fn looks_like_system_chrome(t: &str) -> bool {
             | "sos"
     ) || f.starts_with("homescreen")
         || f.contains("spotlight")
-}
-
-fn first_digit(s: &str) -> Option<char> {
-    s.chars().find(|c| c.is_ascii_digit())
 }
 
 fn trunc(s: &str, max: usize) -> String {
@@ -336,6 +435,10 @@ pub struct Job {
     dump_at: Instant,
     waiting_dump: bool,
     lock_sent: bool,
+    /// Tapped the bank icon; wait for container — do NOT tap the icon again
+    /// (dock y≈0.93 coincides with Cancel on the sheet).
+    app_opened: bool,
+    profile_picked: bool,
     app_tries: u8,
     unlock_tries: u8,
     page_tries: u8,
@@ -364,6 +467,8 @@ impl Job {
             dump_at: Instant::now() - Duration::from_secs(30),
             waiting_dump: false,
             lock_sent: false,
+            app_opened: false,
+            profile_picked: false,
             app_tries: 0,
             unlock_tries: 0,
             page_tries: 0,
@@ -499,8 +604,12 @@ impl Job {
             return;
         }
 
-        // App PIN only after unlock.
-        if has_pad && self.lock_sent && (dump.is_pin() || !on_sb) {
+        // App PIN only after unlock — never while container sheet is up.
+        if has_pad
+            && self.lock_sent
+            && !dump.is_container()
+            && (dump.is_pin() || (!on_sb && self.profile_picked))
+        {
             if self.app_tries >= 5 {
                 self.fail("ошибка сервера повторяется");
                 return;
@@ -530,29 +639,20 @@ impl Job {
                 self.note("DECIDE already-unlocked: SpringBoard home without pad");
             } else {
                 self.unlock_tries = self.unlock_tries.saturating_add(1);
-                if self.unlock_tries > 12 {
+                if self.unlock_tries > 14 {
                     self.fail("не разблокировал экран (нет PIN-пада)");
                     return;
                 }
                 self.status = "разблокировка…".into();
-                if self.unlock_tries <= 2 {
+                if self.unlock_tries <= 3 {
                     self.note(&format!(
-                        "DECIDE wake try={} — full backlight wake",
+                        "DECIDE wake try={} — repeated full wake",
                         self.unlock_tries
                     ));
                     action(tx, SystemAction::Wake);
-                    self.note("ACT Wake");
-                    // Small tap so CoverSheet becomes interactive after dim wake.
-                    let _ = tx.send(InputFrame::new(
-                        MessageType::InputTouch,
-                        protocol::encode_touch(TouchPhase::Down, 0, 0.50, 0.55),
-                    ));
-                    let _ = tx.send(InputFrame::new(
-                        MessageType::InputTouch,
-                        protocol::encode_touch(TouchPhase::Up, 0, 0.50, 0.55),
-                    ));
-                    self.note("ACT tap 0.50,0.55 (wake nudge)");
-                    self.mark_stale(now, 900);
+                    action(tx, SystemAction::Wake);
+                    self.note("ACT Wake×2");
+                    self.mark_stale(now, 1100);
                 } else {
                     self.note(&format!(
                         "DECIDE swipe-unlock try={} reason=waiting for lock pad",
@@ -566,23 +666,26 @@ impl Job {
             }
         }
 
+        // Container sheet: pick profile only — never re-tap dock icon (Cancel zone).
         if dump.is_container() {
-            if let Some(n) = dump.find(&self.profile) {
+            let seen = dump.profiles();
+            if let Some(n) = dump.find_profile(&self.profile) {
                 self.status = format!("выбираю {}", self.profile);
                 self.decide(
                     "container",
-                    &format!("нашёл профиль «{}»", self.profile),
+                    &format!("профиль «{}» (h={:.2})", self.profile, n.h),
                     n,
                     now,
                 );
-                self.until = now + Duration::from_millis(1200);
-                self.need_dump(tx, now);
-                self.phase = Phase::Work;
+                self.profile_picked = true;
+                self.app_opened = true;
                 self.stall = 0;
+                self.phase = Phase::Work;
+                self.mark_stale(now, 1600);
+                self.need_dump(tx, now);
                 return;
             }
             self.stall = self.stall.saturating_add(1);
-            let seen = dump.profiles();
             self.note(&format!(
                 "DECIDE scroll-container stall={} want={} seen=[{}]",
                 self.stall,
@@ -594,27 +697,56 @@ impl Job {
                 return;
             }
             self.status = "листаю список".into();
-            swipe(tx, 0.50, 0.70, 0.50, 0.38);
-            self.note("ACT swipe list 0.50,0.70 → 0.50,0.38");
-            self.until = now + Duration::from_millis(800);
+            swipe(tx, 0.50, 0.68, 0.50, 0.36);
+            self.note("ACT swipe list 0.50,0.68 → 0.50,0.36");
+            self.mark_stale(now, 900);
             self.need_dump(tx, now);
             return;
         }
 
         if on_sb {
+            if self.app_opened && !self.profile_picked {
+                self.stall = self.stall.saturating_add(1);
+                self.note(&format!(
+                    "WAIT container after app open stall={}",
+                    self.stall
+                ));
+                if self.stall > 5 {
+                    self.note("container lost — will reopen app once");
+                    self.app_opened = false;
+                    self.stall = 0;
+                } else {
+                    self.need_dump(tx, now);
+                    self.until = now + Duration::from_millis(700);
+                    return;
+                }
+            }
+            if self.profile_picked {
+                // Profile chosen but still on SB dump — wait for in-app / PIN.
+                self.note("WAIT app UI after profile");
+                self.need_dump(tx, now);
+                self.until = now + Duration::from_millis(800);
+                self.stall = self.stall.saturating_add(1);
+                if self.stall > 8 {
+                    self.fail("после профиля не появился экран приложения");
+                }
+                return;
+            }
             if let Some(n) = dump.find_app_icon(&self.app_name) {
                 self.status = format!("открываю {}", self.app_name);
                 self.decide(
                     "springboard",
-                    &format!("иконка «{}»", self.app_name),
+                    &format!("иконка «{}» y={:.2}", self.app_name, n.y),
                     n,
                     now,
                 );
-                self.until = now + Duration::from_millis(1400);
-                self.need_dump(tx, now);
-                self.phase = Phase::Work;
+                self.app_opened = true;
                 self.page_tries = 0;
                 self.stall = 0;
+                self.phase = Phase::Work;
+                // Critical: do not act on stale home dump (would re-tap dock→Cancel).
+                self.mark_stale(now, 1800);
+                self.need_dump(tx, now);
                 return;
             }
             self.page_tries = self.page_tries.saturating_add(1);
@@ -627,10 +759,9 @@ impl Job {
                 return;
             }
             self.status = "листаю домашний экран…".into();
-            // Next icon page.
             swipe(tx, 0.82, 0.55, 0.18, 0.55);
             self.note("ACT swipe page 0.82,0.55 → 0.18,0.55");
-            self.until = now + Duration::from_millis(700);
+            self.mark_stale(now, 700);
             self.need_dump(tx, now);
             return;
         }
@@ -723,24 +854,37 @@ impl Job {
     }
 
     fn queue_digits(&mut self, dump: &Dump, pin: &str, tag: &str, now: Instant) -> bool {
+        let geo = if tag.starts_with("app") {
+            &APP_PAD
+        } else {
+            &LOCK_PAD
+        };
+        let allow_geo = !dump.has_digit_pad();
         let mut pts = Vec::new();
         let mut used_geo = false;
         for c in pin.chars() {
             if let Some(n) = dump.find_digit(c) {
                 pts.push((n.x, n.y, c, false));
-            } else if let Some(d) = c.to_digit(10) {
-                let (x, y) = LOCK_PAD[d as usize];
-                pts.push((x, y, c, true));
-                used_geo = true;
+            } else if allow_geo {
+                if let Some(d) = c.to_digit(10) {
+                    let (x, y) = geo[d as usize];
+                    pts.push((x, y, c, true));
+                    used_geo = true;
+                } else {
+                    self.note(&format!("FAIL {tag}: bad pin char '{c}'"));
+                    return false;
+                }
             } else {
-                self.note(&format!("FAIL {tag}: bad pin char '{c}'"));
+                self.note(&format!(
+                    "FAIL {tag}: digit '{c}' not on pad (refuse mixed geo)"
+                ));
                 return false;
             }
         }
         let path: Vec<String> = pts
             .iter()
-            .map(|(x, y, c, geo)| {
-                if *geo {
+            .map(|(x, y, c, g)| {
+                if *g {
                     format!("{c}@geo{x:.2},{y:.2}")
                 } else {
                     format!("{c}@{x:.2},{y:.2}")
@@ -749,7 +893,7 @@ impl Job {
             .collect();
         self.note(&format!(
             "ACT {tag} digits{} {}",
-            if used_geo { " (geom fallback)" } else { "" },
+            if used_geo { " (geom)" } else { "" },
             path.join(" ")
         ));
         for (x, y, c, _) in pts {
