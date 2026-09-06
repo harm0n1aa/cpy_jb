@@ -38,6 +38,94 @@ static void setCaptureNote(NSString *msg) {
 #import "SpringBoardLookup.h"
 #endif
 
+static NSData *jpegEncodeImage(CGImageRef image, CGFloat quality);
+
+// UIKit private screen capture — works inside SpringBoard; usually empty from launchd.
+static NSData *jpegFromUIKitPrivate(CGFloat quality, int *outWidth, int *outHeight) {
+    dlopen("/System/Library/Frameworks/UIKit.framework/UIKit", RTLD_LAZY);
+    const char *syms[] = {"_UICreateScreenUIImage", "UIGetScreenImage", "UICreateScreenImage", NULL};
+    typedef CGImageRef (*UiFn)(void);
+    for (const char **s = syms; *s; s++) {
+        UiFn fn = (UiFn)dlsym(RTLD_DEFAULT, *s);
+        if (!fn) {
+            continue;
+        }
+        CGImageRef img = fn();
+        if (!img) {
+            continue;
+        }
+        int tw = (int)CGImageGetWidth(img);
+        int th = (int)CGImageGetHeight(img);
+        NSData *jpeg = jpegEncodeImage(img, quality);
+        CGImageRelease(img);
+        if (jpeg && tw > 1 && th > 1) {
+            if (outWidth) {
+                *outWidth = tw;
+            }
+            if (outHeight) {
+                *outHeight = th;
+            }
+            NSLog(@"[ioscpy] screenshot via %s %dx%d", *s, tw, th);
+            return jpeg;
+        }
+    }
+    return nil;
+}
+
+#ifndef IOSPY_IN_DAEMON
+// Draw the key window hierarchy — reliable inside SpringBoard when CARenderServer
+// returns an empty surface (common on iOS 16+ with some display names).
+static NSData *jpegFromKeyWindow(CGFloat quality, int *outWidth, int *outHeight) {
+    __block NSData *out = nil;
+    __block int w = 0, h = 0;
+    void (^snap)(void) = ^{
+        UIApplication *app = [UIApplication sharedApplication];
+        if (!app) {
+            return;
+        }
+        UIWindow *win = nil;
+        for (UIWindow *candidate in app.windows) {
+            if (candidate.isKeyWindow) {
+                win = candidate;
+                break;
+            }
+        }
+        if (!win) {
+            win = app.windows.firstObject;
+        }
+        if (!win || win.bounds.size.width < 2 || win.bounds.size.height < 2) {
+            return;
+        }
+        CGFloat scale = [UIScreen mainScreen].scale;
+        if (scale < 1) {
+            scale = 1;
+        }
+        UIGraphicsBeginImageContextWithOptions(win.bounds.size, YES, scale);
+        BOOL ok = [win drawViewHierarchyInRect:win.bounds afterScreenUpdates:NO];
+        UIImage *img = UIGraphicsGetImageFromCurrentImageContext();
+        UIGraphicsEndImageContext();
+        if (!ok || !img.CGImage) {
+            return;
+        }
+        w = (int)CGImageGetWidth(img.CGImage);
+        h = (int)CGImageGetHeight(img.CGImage);
+        out = jpegEncodeImage(img.CGImage, quality);
+    };
+    if ([NSThread isMainThread]) {
+        snap();
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), snap);
+    }
+    if (out && outWidth) {
+        *outWidth = w;
+    }
+    if (out && outHeight) {
+        *outHeight = h;
+    }
+    return out;
+}
+#endif
+
 static int collectRenderClients(uint32_t *ids, int max) {
     int n = 0;
 #ifdef IOSPY_IN_DAEMON
@@ -544,37 +632,6 @@ static NSData *jpegFromRender(CARenderServerRenderDisplayFn render, CFStringRef 
 }
 
 #ifdef IOSPY_IN_DAEMON
-static NSData *jpegFromUIKitPrivate(CGFloat quality, int *outWidth, int *outHeight) {
-    dlopen("/System/Library/Frameworks/UIKit.framework/UIKit", RTLD_LAZY);
-    const char *syms[] = {"UIGetScreenImage", "_UICreateScreenUIImage", "UICreateScreenImage", NULL};
-    typedef CGImageRef (*UiFn)(void);
-    for (const char **s = syms; *s; s++) {
-        UiFn fn = (UiFn)dlsym(RTLD_DEFAULT, *s);
-        if (!fn) {
-            continue;
-        }
-        CGImageRef img = fn();
-        if (!img) {
-            continue;
-        }
-        int tw = (int)CGImageGetWidth(img);
-        int th = (int)CGImageGetHeight(img);
-        NSData *jpeg = jpegEncodeImage(img, quality);
-        CGImageRelease(img);
-        if (jpeg && tw > 1 && th > 1) {
-            if (outWidth) {
-                *outWidth = tw;
-            }
-            if (outHeight) {
-                *outHeight = th;
-            }
-            NSLog(@"[ioscpyd] screenshot via %s %dx%d", *s, tw, th);
-            return jpeg;
-        }
-    }
-    return nil;
-}
-
 static NSData *jpegFromSpringBoardServices(CGFloat quality, int *outWidth, int *outHeight) {
     void *h = dlopen(
         "/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices",
@@ -670,25 +727,48 @@ NSData *IOSPYCaptureScreenJPEG(CGFloat maxDimension, CGFloat quality,
                                                   native.height, render != NULL]);
         return nil;
 #else
+        // Inside SpringBoard: try UIKit APIs first — CARenderServer often paints
+        // an empty surface on iOS 16+ depending on display name / client id.
+        NSData *ui = jpegFromUIKitPrivate(quality, outWidth, outHeight);
+        if (ui) {
+            setCaptureNote(@"tweak-uikit");
+            return ui;
+        }
+        NSData *win = jpegFromKeyWindow(quality, outWidth, outHeight);
+        if (win) {
+            setCaptureNote(@"tweak-keywindow");
+            return win;
+        }
         CARenderServerRenderDisplayFn render = renderDisplayFn();
         if (!render) {
-            return jpegFromFramebuffer(maxDimension, quality, outWidth, outHeight, outRenderMs,
-                                       outEncodeMs);
+            NSData *fb = jpegFromFramebuffer(maxDimension, quality, outWidth, outHeight, outRenderMs,
+                                             outEncodeMs);
+            setCaptureNote(fb ? @"tweak-framebuffer" : @"tweak-no-backend");
+            return fb;
         }
 
         CGSize native = nativeScreenSize();
         if (native.width < 1 || native.height < 1) {
-            return jpegFromFramebuffer(maxDimension, quality, outWidth, outHeight, outRenderMs,
-                                       outEncodeMs);
+            NSData *fb = jpegFromFramebuffer(maxDimension, quality, outWidth, outHeight, outRenderMs,
+                                             outEncodeMs);
+            setCaptureNote(fb ? @"tweak-framebuffer" : @"tweak-no-size");
+            return fb;
         }
-        NSData *jpeg = jpegFromRender(render, mainDisplayName(), (int)native.width, (int)native.height,
-                                      maxDimension, quality, outWidth, outHeight, outRenderMs,
-                                      outEncodeMs);
-        if (jpeg) {
-            return jpeg;
+        CFStringRef names[] = {mainDisplayName(), CFSTR("LCD"), CFSTR("Main"), CFSTR("built-in"),
+                               NULL};
+        for (CFStringRef *name = names; *name; name++) {
+            NSData *jpeg = jpegFromRender(render, *name, (int)native.width, (int)native.height,
+                                          maxDimension, quality, outWidth, outHeight, outRenderMs,
+                                          outEncodeMs);
+            if (jpeg) {
+                setCaptureNote(@"tweak-render");
+                return jpeg;
+            }
         }
-        return jpegFromFramebuffer(maxDimension, quality, outWidth, outHeight, outRenderMs,
-                                   outEncodeMs);
+        NSData *fb = jpegFromFramebuffer(maxDimension, quality, outWidth, outHeight, outRenderMs,
+                                         outEncodeMs);
+        setCaptureNote(fb ? @"tweak-framebuffer" : @"tweak-fail");
+        return fb;
 #endif
     }
 }

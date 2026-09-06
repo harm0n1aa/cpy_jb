@@ -442,27 +442,44 @@ fn draw_panel(ui: &mut Ui, app: &mut AutoApp) {
                             live.diag.lock().map(|g| g.clone()).unwrap_or_default();
                         if !diag_lines.is_empty() {
                             ui.add_space(6.0);
-                            ui.label(egui::RichText::new("диагностика").size(11.0).color(MUTED));
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("диагностика").size(11.0).color(MUTED),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .add(
+                                                egui::Button::new(
+                                                    egui::RichText::new("копировать")
+                                                        .size(11.0)
+                                                        .color(ACCENT),
+                                                )
+                                                .fill(Color32::TRANSPARENT)
+                                                .stroke(Stroke::NONE),
+                                            )
+                                            .clicked()
+                                        {
+                                            ui.ctx().copy_text(diag_lines.join("\n"));
+                                            live.status = "диагностика скопирована".into();
+                                        }
+                                    },
+                                );
+                            });
+                            let text = diag_lines.join("\n");
                             egui::ScrollArea::vertical()
                                 .id_salt("diag")
-                                .max_height(180.0)
+                                .max_height(220.0)
                                 .show(ui, |ui| {
-                                    for line in &diag_lines {
-                                        ui.label(
-                                            egui::RichText::new(line)
-                                                .size(10.5)
-                                                .family(egui::FontFamily::Monospace)
-                                                .color(if line.contains("FAIL")
-                                                    || line.contains('✗')
-                                                {
-                                                    DANGER
-                                                } else if line.starts_with("OK") {
-                                                    LIVE
-                                                } else {
-                                                    MUTED
-                                                }),
-                                        );
-                                    }
+                                    let mut buf = text;
+                                    ui.add(
+                                        egui::TextEdit::multiline(&mut buf)
+                                            .font(FontId::monospace(11.0))
+                                            .desired_width(f32::INFINITY)
+                                            .text_color(TEXT)
+                                            .frame(false),
+                                    );
                                 });
                         }
                     }

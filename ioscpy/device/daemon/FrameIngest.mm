@@ -20,6 +20,8 @@
     BOOL _videoReliable; // YES while an H.264 stream needs in-order delivery
     BOOL _wantStream;   // host asked to stream; replay if the tweak attaches late
     uint8_t _wantCodec;
+    uint64_t _framesFromTweak;
+    NSUInteger _lastFrameBytes;
 }
 
 + (instancetype)shared {
@@ -140,6 +142,10 @@
                 break;
             }
             if (header.type == IOSPYMsgVideoFrame && payload.length > 0) {
+                [_writeLock lock];
+                _framesFromTweak++;
+                _lastFrameBytes = payload.length;
+                [_writeLock unlock];
                 BOOL reliable;
                 @synchronized(self) {
                     reliable = _videoReliable;
@@ -200,6 +206,20 @@
     BOOL connected = _tweakFd >= 0;
     [_writeLock unlock];
     return connected;
+}
+
+- (uint64_t)framesFromTweak {
+    [_writeLock lock];
+    uint64_t n = _framesFromTweak;
+    [_writeLock unlock];
+    return n;
+}
+
+- (NSUInteger)lastFrameBytes {
+    [_writeLock lock];
+    NSUInteger n = _lastFrameBytes;
+    [_writeLock unlock];
+    return n;
 }
 
 - (void)tellTweakStartCodec:(uint8_t)codec {

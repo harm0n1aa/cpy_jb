@@ -18,7 +18,7 @@
 #import <unistd.h>
 #import <errno.h>
 
-NSString *const IOSPYDaemonVersion = @"0.1.30";
+NSString *const IOSPYDaemonVersion = @"0.1.31";
 
 @implementation IOSPYControlServer {
     uint16_t _port;
@@ -211,9 +211,10 @@ NSString *const IOSPYDaemonVersion = @"0.1.30";
                             message:[NSString stringWithFormat:@"твик не в SpringBoard (%@). захват: %@",
                                                                why, cap.length ? cap : @"ещё нет"]];
                     [writeLock unlock];
-                }
-                if (!reliable) {
                     [[IOSPYDaemonCapture shared] start];
+                } else {
+                    // Tweak owns capture. Daemon CARenderServer is usually empty on iOS 16+.
+                    [[IOSPYDaemonCapture shared] stop];
                 }
                 if (!streaming) {
                     streaming = YES;

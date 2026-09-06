@@ -14,6 +14,10 @@
 // Whether a tweak is currently connected and able to stream.
 - (BOOL)tweakConnected;
 
+// Video frames received from the tweak since daemon start (diagnostics).
+- (uint64_t)framesFromTweak;
+- (NSUInteger)lastFrameBytes;
+
 // Tell the tweak to begin capturing with a codec (0 = MJPEG, 1 = H.264) / stop.
 - (void)tellTweakStartCodec:(uint8_t)codec;
 - (void)tellTweakStop;

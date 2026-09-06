@@ -351,6 +351,11 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
     int width = 0, height = 0;
     NSData *jpeg = IOSPYCaptureScreenJPEG(kMaxDimension, kQuality, &width, &height, NULL, NULL);
     if (!jpeg) {
+        static int fails = 0;
+        fails++;
+        if (fails == 1 || fails == 30 || (fails % 120) == 0) {
+            NSLog(@"[ioscpyhook] JPEG capture failed n=%d note=%@", fails, IOSPYCaptureLastNote());
+        }
         return;
     }
     IOSPYWriteFrame(fd, IOSPYMsgVideoFrame, IOSPY_CHANNEL_VIDEO, 0,

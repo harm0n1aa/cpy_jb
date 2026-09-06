@@ -63,19 +63,19 @@ fn set_status(slot: &Option<Arc<Mutex<Option<String>>>>, msg: String) {
 fn phone_status(ack: &protocol::HelloAck) -> String {
     let c = &ack.capabilities;
     if c.keyboard {
-        return "демон ответил, ждём кадр…".into();
+        return "демон + твик OK — ждём кадр…".into();
     }
     if !c.diag_summary.is_empty() {
         return c.diag_summary.clone();
     }
     if !c.hook_dylib {
-        return "твик не установлен — поставь 0.1.23 с LAN-репо".into();
+        return "твик не установлен — поставь ioscpy из LAN-репо".into();
     }
     if !c.inject_error.is_empty() {
         return format!("инжект: {}", c.inject_error);
     }
     if !c.hook_loaded {
-        return "ElleKit не загрузил твик (arm64 в arm64e SpringBoard)".into();
+        return "ElleKit не загрузил твик — Restart SpringBoard".into();
     }
     "твик загрузился, но не подключился к демону".into()
 }
