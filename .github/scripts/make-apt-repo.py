@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Build a flat Sileo/apt repo directory from one or more .deb files."""
+"""Build a Sileo/apt repo (flat + dists/) from one or more .deb files."""
 from __future__ import annotations
 
 import argparse
 import gzip
 import hashlib
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -18,7 +19,6 @@ def sha(data: bytes, name: str) -> str:
 
 def control_from_deb(deb: Path) -> str:
     out = subprocess.check_output(["dpkg-deb", "-f", str(deb)], text=True)
-    # Drop fields that we rewrite for the repo index.
     drop = {"Filename", "Size", "MD5sum", "SHA1", "SHA256", "Status"}
     lines = []
     for line in out.splitlines():
@@ -31,12 +31,10 @@ def control_from_deb(deb: Path) -> str:
     return "\n".join(lines) + "\n"
 
 
-def packages_entry(deb: Path) -> str:
-    data = deb.read_bytes()
-    ctrl = control_from_deb(deb)
+def packages_entry(deb_name: str, data: bytes, ctrl: str) -> str:
     return (
         f"{ctrl}"
-        f"Filename: {deb.name}\n"
+        f"Filename: {deb_name}\n"
         f"Size: {len(data)}\n"
         f"MD5sum: {sha(data, 'md5')}\n"
         f"SHA1: {sha(data, 'sha1')}\n"
@@ -45,23 +43,37 @@ def packages_entry(deb: Path) -> str:
     )
 
 
-def write_release(repo: Path, packages: bytes, packages_gz: bytes) -> None:
-    # Minimal unsigned Release; Sileo accepts it for third-party sources.
-    body = (
+def release_body(file_map: dict[str, bytes]) -> str:
+    """file_map: path relative to the Release file's directory -> content."""
+    md5_lines = []
+    sha1_lines = []
+    sha256_lines = []
+    for rel, data in sorted(file_map.items()):
+        md5_lines.append(f" {sha(data, 'md5')} {len(data)} {rel}")
+        sha1_lines.append(f" {sha(data, 'sha1')} {len(data)} {rel}")
+        sha256_lines.append(f" {sha(data, 'sha256')} {len(data)} {rel}")
+    return (
         "Origin: ioscpy\n"
         "Label: ioscpy\n"
         "Suite: stable\n"
         "Version: 1.0\n"
-        "Codename: ios\n"
+        "Codename: stable\n"
         "Architectures: iphoneos-arm64\n"
         "Components: main\n"
         "Description: ioscpy Mac-built packages (arm64 + arm64e)\n"
-        f"MD5Sum:\n {sha(packages, 'md5')} {len(packages)} Packages\n"
-        f" {sha(packages_gz, 'md5')} {len(packages_gz)} Packages.gz\n"
-        f"SHA256:\n {sha(packages, 'sha256')} {len(packages)} Packages\n"
-        f" {sha(packages_gz, 'sha256')} {len(packages_gz)} Packages.gz\n"
+        "MD5Sum:\n"
+        + "\n".join(md5_lines)
+        + "\nSHA1:\n"
+        + "\n".join(sha1_lines)
+        + "\nSHA256:\n"
+        + "\n".join(sha256_lines)
+        + "\n"
     )
-    (repo / "Release").write_text(body, encoding="utf-8")
+
+
+def write_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
 
 
 def main() -> None:
@@ -71,32 +83,66 @@ def main() -> None:
     args = ap.parse_args()
 
     repo = args.out
-    repo.mkdir(parents=True, exist_ok=True)
+    if repo.exists():
+        shutil.rmtree(repo)
+    repo.mkdir(parents=True)
+
     entries: list[str] = []
+    deb_files: list[tuple[str, bytes]] = []
     for deb in args.debs:
         if not deb.is_file():
             raise SystemExit(f"missing deb: {deb}")
-        dest = repo / deb.name
-        dest.write_bytes(deb.read_bytes())
-        # Stable alias for humans / docs.
+        data = deb.read_bytes()
+        ctrl = control_from_deb(deb)
+        write_bytes(repo / deb.name, data)
         if re.search(r"com\.ioscpy\.device_", deb.name):
-            (repo / "ioscpy.deb").write_bytes(deb.read_bytes())
-        entries.append(packages_entry(dest))
+            write_bytes(repo / "ioscpy.deb", data)
+        # Also under dists path (some clients resolve relative to binary-*).
+        write_bytes(
+            repo / "dists/stable/main/binary-iphoneos-arm64" / deb.name,
+            data,
+        )
+        deb_files.append((deb.name, data))
+        entries.append(packages_entry(deb.name, data, ctrl))
 
     packages = "".join(entries).encode("utf-8")
     packages_gz = gzip.compress(packages, mtime=0)
-    (repo / "Packages").write_bytes(packages)
-    (repo / "Packages.gz").write_bytes(packages_gz)
-    write_release(repo, packages, packages_gz)
-    (repo / "index.html").write_text(
-        "<!doctype html><meta charset=utf-8><title>ioscpy</title>"
-        "<h1>ioscpy apt source</h1>"
-        "<p>Add this URL in Sileo → Sources:</p>"
-        "<pre>https://harm0n1aa.github.io/cpy_jb/</pre>"
-        "<p>Then search <b>ioscpy</b> and install.</p>\n",
-        encoding="utf-8",
+
+    # Flat root (Cydia-style) — same as our LAN serve-deb.py.
+    write_bytes(repo / "Packages", packages)
+    write_bytes(repo / "Packages.gz", packages_gz)
+    write_bytes(
+        repo / "Release",
+        release_body({"Packages": packages, "Packages.gz": packages_gz}).encode(),
+    )
+
+    # Standard apt dists tree — what modern Sileo/APT actually fetches.
+    bin_dir = "main/binary-iphoneos-arm64"
+    write_bytes(repo / "dists/stable" / bin_dir / "Packages", packages)
+    write_bytes(repo / "dists/stable" / bin_dir / "Packages.gz", packages_gz)
+    write_bytes(
+        repo / "dists/stable/Release",
+        release_body(
+            {
+                f"{bin_dir}/Packages": packages,
+                f"{bin_dir}/Packages.gz": packages_gz,
+            }
+        ).encode(),
+    )
+
+    write_bytes(
+        repo / "index.html",
+        (
+            "<!doctype html><meta charset=utf-8><title>ioscpy</title>"
+            "<h1>ioscpy apt source</h1>"
+            "<p>Add this URL in Sileo → Sources:</p>"
+            "<pre>https://harm0n1aa.github.io/cpy_jb/</pre>"
+            "<p>Then refresh sources, search <b>ioscpy</b>, install 0.1.27+.</p>\n"
+        ).encode(),
     )
     print(f"wrote apt repo -> {repo} ({len(args.debs)} deb(s))")
+    for name, _ in deb_files:
+        print(f"  {name}")
 
 
 if __name__ == "__main__":
