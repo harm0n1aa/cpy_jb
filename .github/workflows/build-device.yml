@@ -83,7 +83,7 @@ jobs:
             THEOS_PACKAGE_SCHEME=roothide \
             THEOS_PACKAGE_ARCH=iphoneos-arm64 \
             ARCHS="arm64 arm64e" \
-            TARGET="iphone:clang:15.0:14.0"
+            TARGET="iphone:clang:16.5:14.0"
           ls -la packages
           # Theos sometimes still stamps arm64e into the control; rewrite for Dopamine/Sileo.
           for deb in packages/*.deb; do
