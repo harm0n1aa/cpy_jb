@@ -29,3 +29,9 @@ id_rsa*
 *.token
 secrets.env
 .env
+
+# Local apt publish trees
+_ghio_repo/
+_tmp_github_io/
+_sileo_deb/
+
