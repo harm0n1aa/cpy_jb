@@ -3,9 +3,13 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <mach/mach_time.h>
+#import <notify.h>
 #if __has_include(<IOKit/IOKitLib.h>)
 #import <IOKit/IOKitLib.h>
 #define IOSPY_HAS_IOKITLIB 1
+#ifndef IORegistryEntryGetRegistryEntryID
+extern "C" kern_return_t IORegistryEntryGetRegistryEntryID(io_registry_entry_t entry, uint64_t *entryID);
+#endif
 #endif
 
 // Private IOKit HID SPI, not in the public headers, so declared here. Touches are
@@ -470,25 +474,174 @@ static bool charToUsage(unichar c, uint32_t *usage, bool *shift) {
     }
 }
 
+#define kIOSPYKbPrefs CFSTR("com.ioscpy.kb")
+#define kIOSPYKbNotify "com.ioscpy.kb.text"
+
+static __weak UIResponder *gFirstResponder;
+
+@interface UIResponder (IOSPYKb)
+- (void)ioscpy_findFirstResponder:(id)sender;
+@end
+
+@implementation UIResponder (IOSPYKb)
+- (void)ioscpy_findFirstResponder:(id)sender {
+    (void)sender;
+    gFirstResponder = self;
+}
+@end
+
+static BOOL IOSPYIsSpringBoard(void) {
+    return [NSBundle.mainBundle.bundleIdentifier isEqualToString:@"com.apple.springboard"];
+}
+
+static BOOL IOSPYAppIsForeground(void) {
+    UIApplication *app = [UIApplication sharedApplication];
+    if (!app) {
+        return NO;
+    }
+    return app.applicationState == UIApplicationStateActive;
+}
+
+static BOOL IOSPYTryInsertLocal(NSString *text) {
+    if (text.length == 0) {
+        return NO;
+    }
+
+    Class kbdCls = NSClassFromString(@"UIKeyboardImpl");
+    id kbd = nil;
+    if ([kbdCls respondsToSelector:@selector(activeInstance)]) {
+        kbd = ((id (*)(id, SEL))objc_msgSend)(kbdCls, @selector(activeInstance));
+    }
+    if (!kbd && [kbdCls respondsToSelector:@selector(sharedInstance)]) {
+        kbd = ((id (*)(id, SEL))objc_msgSend)(kbdCls, @selector(sharedInstance));
+    }
+    if ([kbd respondsToSelector:@selector(addInputString:)]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(kbd, @selector(addInputString:), text);
+        return YES;
+    }
+
+    gFirstResponder = nil;
+    [[UIApplication sharedApplication] sendAction:@selector(ioscpy_findFirstResponder:)
+                                               to:nil
+                                             from:nil
+                                         forEvent:nil];
+    UIResponder *resp = gFirstResponder;
+    if ([resp isFirstResponder] && [resp respondsToSelector:@selector(insertText:)]) {
+        [(id<UIKeyInput>)resp insertText:text];
+        return YES;
+    }
+    return NO;
+}
+
+static void IOSPYBroadcastText(NSString *text) {
+    @autoreleasepool {
+        CFArrayRef existing = (CFArrayRef)CFPreferencesCopyAppValue(CFSTR("q"), kIOSPYKbPrefs);
+        NSMutableArray *q = existing ? [(__bridge NSArray *)existing mutableCopy] : [NSMutableArray array];
+        if (existing) {
+            CFRelease(existing);
+        }
+        if (q.count > 80) {
+            [q removeObjectsInRange:NSMakeRange(0, q.count - 40)];
+        }
+        static uint64_t seq = 0;
+        seq++;
+        [q addObject:@{@"i": @(seq), @"t": text}];
+        CFPreferencesSetAppValue(CFSTR("q"), (__bridge CFArrayRef)q, kIOSPYKbPrefs);
+        CFPreferencesAppSynchronize(kIOSPYKbPrefs);
+        notify_post(kIOSPYKbNotify);
+    }
+}
+
+static void IOSPYDrainBroadcast(void) {
+    static uint64_t last = 0;
+    static BOOL primed = NO;
+    CFArrayRef raw = (CFArrayRef)CFPreferencesCopyAppValue(CFSTR("q"), kIOSPYKbPrefs);
+    if (!raw) {
+        return;
+    }
+    NSArray *q = (__bridge NSArray *)raw;
+    if (!primed) {
+        primed = YES;
+        for (NSDictionary *item in q) {
+            if (![item isKindOfClass:[NSDictionary class]]) {
+                continue;
+            }
+            uint64_t i = [item[@"i"] unsignedLongLongValue];
+            if (i > last) {
+                last = i;
+            }
+        }
+        CFRelease(raw);
+        return;
+    }
+    for (NSDictionary *item in q) {
+        if (![item isKindOfClass:[NSDictionary class]]) {
+            continue;
+        }
+        uint64_t i = [item[@"i"] unsignedLongLongValue];
+        if (i <= last) {
+            continue;
+        }
+        last = i;
+        NSString *t = item[@"t"];
+        if ([t isKindOfClass:[NSString class]] && t.length > 0) {
+            IOSPYTryInsertLocal(t);
+        }
+    }
+    CFRelease(raw);
+}
+
+static void IOSPYKbNotify(CFNotificationCenterRef center, void *observer, CFStringRef name,
+                         const void *object, CFDictionaryRef userInfo) {
+    (void)center;
+    (void)observer;
+    (void)name;
+    (void)object;
+    (void)userInfo;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (IOSPYIsSpringBoard()) {
+            return;
+        }
+        if (!IOSPYAppIsForeground()) {
+            return;
+        }
+        IOSPYDrainBroadcast();
+    });
+}
+
+static void IOSPYInsertUnicode(NSString *text) {
+    if (text.length == 0) {
+        return;
+    }
+    if (IOSPYTryInsertLocal(text)) {
+        return;
+    }
+    if (IOSPYIsSpringBoard()) {
+        IOSPYBroadcastText(text);
+    }
+}
+
+void IOSPYTextInjectionStart(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
+                                        IOSPYKbNotify, CFSTR(kIOSPYKbNotify), NULL,
+                                        CFNotificationSuspensionBehaviorDeliverImmediately);
+        if (!IOSPYIsSpringBoard()) {
+            IOSPYDrainBroadcast();
+        }
+    });
+}
+
 void IOSPYTypeText(NSString *text) {
     if (text.length == 0) {
         return;
     }
     dispatch_async(dispatch_get_main_queue(), ^{
-        hidInit();
-        if (!gClient) {
-            return;
-        }
-        NSUInteger n = text.length;
-        for (NSUInteger i = 0; i < n; i++) {
-            unichar c = [text characterAtIndex:i];
-            uint32_t usage = 0;
-            bool shift = false;
-            if (charToUsage(c, &usage, &shift)) {
-                typeUsage(usage, shift);
-            }
-            // Non-ASCII (accents, emoji) go through the clipboard-paste path.
-        }
+        // Same path for Latin and Cyrillic. HID letter keys stop reaching the
+        // field once unicode has been inserted via UIKeyboardImpl.
+        NSString *clean = [text stringByReplacingOccurrencesOfString:@"\uFE0E" withString:@""];
+        IOSPYInsertUnicode(clean);
     });
 }
 

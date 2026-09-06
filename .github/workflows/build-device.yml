@@ -1,0 +1,135 @@
+# Build ioscpy device package on a real Mac (Xcode) with arm64 + arm64e,
+# then publish a Sileo apt source on GitHub Pages.
+name: Build device (macOS arm64e)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "ioscpy/device/**"
+      - ".github/workflows/build-device.yml"
+      - ".github/scripts/make-apt-repo.py"
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: build-device-pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Install brew tools
+        run: |
+          brew install ldid dpkg make
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      - name: Cache Theos (roothide)
+        id: cache-theos
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.theos-roothide
+          key: theos-roothide-${{ runner.os }}-v1
+
+      - name: Install Theos (roothide fork)
+        if: steps.cache-theos.outputs.cache-hit != 'true'
+        run: |
+          git clone --recursive --depth=1 https://github.com/roothide/theos.git \
+            "${{ github.workspace }}/.theos-roothide"
+          # Patched SDKs (link stubs) for jailbreak builds.
+          rm -rf "${{ github.workspace }}/.theos-roothide/sdks"
+          git clone --depth=1 https://github.com/theos/sdks.git \
+            "${{ github.workspace }}/.theos-roothide/sdks"
+
+      - name: Read package version
+        id: ver
+        run: |
+          v=$(awk '/^Version:/{print $2; exit}' ioscpy/device/control)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Building com.ioscpy.device $v"
+
+      - name: Build roothide .deb (arm64 + arm64e)
+        working-directory: ioscpy/device
+        env:
+          THEOS: ${{ github.workspace }}/.theos-roothide
+        run: |
+          # Override ARCHS on the CLI so local/QEMU Linux builds can stay arm64-only.
+          # Pin SDK so "latest" does not pick a bare Xcode SDK without stubs.
+          gmake clean || true
+          gmake package FINALPACKAGE=1 \
+            THEOS_PACKAGE_SCHEME=roothide \
+            ARCHS="arm64 arm64e" \
+            TARGET="iphone:clang:16.5:14.0"
+          ls -la packages
+          lipo -info packages/.theos*/obj*/ioscpyhook.dylib 2>/dev/null || \
+            find .theos -name 'ioscpyhook.dylib' -print -exec lipo -info {} \;
+
+      - name: Verify arm64e slice in hook
+        working-directory: ioscpy/device
+        run: |
+          set -euo pipefail
+          DY=$(find .theos packages -name 'ioscpyhook.dylib' | head -n1)
+          echo "hook: $DY"
+          lipo -info "$DY"
+          lipo -info "$DY" | grep -q arm64e
+
+      - name: Build apt repo for Sileo
+        run: |
+          mkdir -p dist-repo
+          python3 .github/scripts/make-apt-repo.py --out dist-repo \
+            ioscpy/device/packages/*.deb
+          ls -la dist-repo
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ioscpy-device-${{ steps.ver.outputs.version }}
+          path: |
+            dist-repo/
+            ioscpy/device/packages/*.deb
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist-repo
+
+      - name: Publish GitHub Release (Sileo-friendly .deb)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: device-v${{ steps.ver.outputs.version }}
+          name: ioscpy device ${{ steps.ver.outputs.version }} (arm64+arm64e)
+          overwrite_files: true
+          body: |
+            Mac-built package with **arm64 + arm64e** (for iPhone 12 / A14).
+
+            ## Sileo
+            Add source: `https://harm0n1aa.github.io/cpy_jb/`
+            Then search **ioscpy** → Install → Restart SpringBoard.
+          files: |
+            ioscpy/device/packages/*.deb
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  deploy-pages:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -28,6 +28,12 @@ NSData *IOSPYCaptureScreenJPEG(CGFloat maxDimension, CGFloat quality,
                                int *outWidth, int *outHeight,
                                double *outRenderMs, double *outEncodeMs);
 
+#ifdef IOSPY_IN_DAEMON
+NSString *IOSPYCaptureLastNote(void);
+BOOL IOSPYCaptureHasRenderFn(void);
+void IOSPYCaptureProbeFramebuffer(int *outWidth, int *outHeight);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

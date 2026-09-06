@@ -53,6 +53,8 @@ typedef NS_ENUM(uint16_t, IOSPYMessageType) {
     IOSPYMsgPong                 = 61,
     IOSPYMsgError                = 70,
     IOSPYMsgLog                  = 71,
+    IOSPYMsgUiDump               = 80,   // host asks for the foreground UI tree
+    IOSPYMsgUiDumpResult         = 81,   // JSON { bundle, nodes: [...] }
 };
 
 typedef struct {

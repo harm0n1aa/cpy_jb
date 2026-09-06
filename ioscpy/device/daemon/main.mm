@@ -4,6 +4,7 @@
 #import "ControlServer.h"
 #import "FrameIngest.h"
 #import "Protocol.h"
+#import "DaemonHID.h"
 
 int main(int argc, char *argv[]) {
     @autoreleasepool {
@@ -26,6 +27,7 @@ int main(int argc, char *argv[]) {
 
         // Frame channel for the tweak to feed captured frames into.
         [[IOSPYFrameIngest shared] startOnPort:IOSPY_FRAME_PORT];
+        IOSPYDaemonHIDStart();
 
         [server runLoop];
     }

@@ -28,6 +28,49 @@ mkdir -p "$LDDIR" "$LOGDIR"
 chmod 755 "$DAEMON" "$CTL" 2>/dev/null || true
 chown root:wheel "$DAEMON" "$CTL" 2>/dev/null || true
 
+# ElleKit loads tweaks from usr/lib/TweakInject. Older ioscpy packages unpacked a
+# real MobileSubstrate/DynamicLibraries directory and hid that symlink, so the
+# hook never entered SpringBoard.
+INJECT="$PREFIX/usr/lib/TweakInject"
+MSDIR="$PREFIX/Library/MobileSubstrate/DynamicLibraries"
+mkdir -p "$INJECT" "$PREFIX/Library/MobileSubstrate"
+if [ -d "$MSDIR" ] && [ ! -L "$MSDIR" ]; then
+    echo "ioscpy: moving tweaks into TweakInject (was a real directory)"
+    mv "$MSDIR"/* "$INJECT/" 2>/dev/null || true
+    rm -rf "$MSDIR"
+fi
+if [ ! -e "$MSDIR" ]; then
+    ln -s ../../usr/lib/TweakInject "$MSDIR" 2>/dev/null || ln -s "$INJECT" "$MSDIR"
+fi
+# Theos 0.1.12 installs the hook into TweakInject. Keep a copy if an old
+# package left the dylib only under MobileSubstrate.
+if [ ! -f "$INJECT/ioscpyhook.dylib" ]; then
+    for candidate in \
+        "$PREFIX/Library/MobileSubstrate/DynamicLibraries/ioscpyhook.dylib" \
+        /var/jb/Library/MobileSubstrate/DynamicLibraries/ioscpyhook.dylib; do
+        if [ -f "$candidate" ]; then
+            cp -f "$candidate" "$INJECT/ioscpyhook.dylib" 2>/dev/null || true
+            cp -f "${candidate%.dylib}.plist" "$INJECT/ioscpyhook.plist" 2>/dev/null || true
+            break
+        fi
+    done
+fi
+chmod 755 "$INJECT/ioscpyhook.dylib" 2>/dev/null || true
+chmod 644 "$INJECT/ioscpyhook.plist" 2>/dev/null || true
+
+# ElleKit may look at TweakInject or at MobileSubstrate/DynamicLibraries. If the
+# latter is a real directory (broken symlink), put a copy there too.
+if [ -f "$INJECT/ioscpyhook.dylib" ]; then
+    mkdir -p "$MSDIR"
+    cp -f "$INJECT/ioscpyhook.dylib" "$MSDIR/ioscpyhook.dylib" 2>/dev/null || true
+    cp -f "$INJECT/ioscpyhook.plist" "$MSDIR/ioscpyhook.plist" 2>/dev/null || true
+    chmod 755 "$MSDIR/ioscpyhook.dylib" 2>/dev/null || true
+    chmod 644 "$MSDIR/ioscpyhook.plist" 2>/dev/null || true
+    mkdir -p "$PREFIX/Library/TweakInject"
+    cp -f "$INJECT/ioscpyhook.dylib" "$PREFIX/Library/TweakInject/ioscpyhook.dylib" 2>/dev/null || true
+    cp -f "$INJECT/ioscpyhook.plist" "$PREFIX/Library/TweakInject/ioscpyhook.plist" 2>/dev/null || true
+fi
+
 cat > "$PLIST" <<PLISTEOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -64,5 +107,5 @@ launchctl enable system/com.ioscpy.daemon 2>/dev/null || true
 launchctl bootstrap system "$PLIST" 2>/dev/null || launchctl load "$PLIST" 2>/dev/null || true
 launchctl kickstart -k system/com.ioscpy.daemon 2>/dev/null || true
 
-echo "ioscpy installed. Respring to load the tweak."
+echo "ioscpy installed. In Sileo tap Restart SpringBoard when it asks — do not force-kill it from here."
 exit 0

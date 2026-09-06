@@ -4,6 +4,11 @@
 #import "Paths.h"
 #import "FrameStore.h"
 #import "FrameIngest.h"
+#import "DaemonCapture.h"
+#import "Inject.h"
+#import "DaemonHID.h"
+#import "Capture.h"
+#import "Diagnostics.h"
 
 #import <sys/socket.h>
 #import <sys/time.h>
@@ -13,7 +18,7 @@
 #import <unistd.h>
 #import <errno.h>
 
-NSString *const IOSPYDaemonVersion = @"0.1.5";
+NSString *const IOSPYDaemonVersion = @"0.1.24";
 
 @implementation IOSPYControlServer {
     uint16_t _port;
@@ -108,6 +113,9 @@ NSString *const IOSPYDaemonVersion = @"0.1.5";
     }
 
     NSLog(@"[ioscpyd] client connected, sending HELLO_ACK");
+    for (int i = 0; i < 30 && ![[IOSPYFrameIngest shared] tweakConnected]; i++) {
+        usleep(100 * 1000);
+    }
     // Serialize every write to this socket: control replies run on this read
     // thread while video frames come from the pump thread.
     NSLock *writeLock = [[NSLock alloc] init];
@@ -119,6 +127,9 @@ NSString *const IOSPYDaemonVersion = @"0.1.5";
     __block BOOL authenticated = NO;
     [writeLock lock];
     [self sendHelloAck:fd token:sessionToken];
+    for (NSString *line in IOSPYDiagLines()) {
+        [self sendLog:fd level:@"diag" message:line];
+    }
     [self sendLog:fd
             level:@"info"
           message:[NSString stringWithFormat:@"ioscpyd %@ ready, %@ (%@)", IOSPYDaemonVersion,
@@ -167,16 +178,46 @@ NSString *const IOSPYDaemonVersion = @"0.1.5";
                 }
                 break;
             }
-            case IOSPYMsgStartStream:
+            case IOSPYMsgStartStream: {
+                // Always (re)tell the tweak. The first StartStream often arrives
+                // before SpringBoard has attached to the frame channel.
+                uint8_t codec = (payload.length >= 1) ? ((const uint8_t *)payload.bytes)[0] : 0;
+                BOOL h264 = (codec == IOSPY_VIDEO_CODEC_H264);
+                BOOL tweak = [[IOSPYFrameIngest shared] tweakConnected];
+                if (!tweak) {
+                    [[IOSPYDaemonCapture shared] start];
+                    IOSPYInjectHookIfNeeded();
+                    for (int i = 0; i < 25 && ![[IOSPYFrameIngest shared] tweakConnected]; i++) {
+                        usleep(100 * 1000);
+                    }
+                    tweak = [[IOSPYFrameIngest shared] tweakConnected];
+                }
+                // H.264 needs the tweak encoder. Without it, stay on MJPEG so the
+                // daemon's own capture can fill the frame store.
+                BOOL reliable = h264 && tweak;
+                [[IOSPYFrameIngest shared] setVideoReliable:reliable];
+                [[IOSPYFrameIngest shared] tellTweakStartCodec:codec];
+                NSLog(@"[ioscpyd] stream started (codec=%s tweak=%d)", reliable ? "h264" : "mjpeg",
+                      tweak);
+                if (!tweak) {
+                    IOSPYDiagRunSession();
+                    [writeLock lock];
+                    NSString *why = IOSPYInjectLastError();
+                    if (why.length == 0) {
+                        why = @"ElleKit skipped arm64 dylib in arm64e SpringBoard";
+                    }
+                    NSString *cap = IOSPYCaptureLastNote();
+                    [self sendError:fd code:@"NO_TWEAK" fatal:NO
+                            message:[NSString stringWithFormat:@"твик не в SpringBoard (%@). захват: %@",
+                                                               why, cap.length ? cap : @"ещё нет"]];
+                    [writeLock unlock];
+                }
+                if (!reliable) {
+                    [[IOSPYDaemonCapture shared] start];
+                }
                 if (!streaming) {
-                    // 1-byte payload picks the codec (0/empty = MJPEG, 1 = H.264).
-                    uint8_t codec = (payload.length >= 1) ? ((const uint8_t *)payload.bytes)[0] : 0;
-                    BOOL h264 = (codec == IOSPY_VIDEO_CODEC_H264);
                     streaming = YES;
-                    [[IOSPYFrameIngest shared] setVideoReliable:h264];
-                    [[IOSPYFrameIngest shared] tellTweakStartCodec:codec];
-                    NSLog(@"[ioscpyd] stream started (codec=%s)", h264 ? "h264" : "mjpeg");
-                    if (!h264) {
+                    if (!reliable) {
                         // MJPEG: latest-only pump that drops stale frames under
                         // backpressure so motion stays smooth. H.264 goes out in
                         // order straight from the ingest thread instead.
@@ -212,6 +253,7 @@ NSString *const IOSPYDaemonVersion = @"0.1.5";
                     }
                 }
                 break;
+            }
             case IOSPYMsgStopStream:
                 if (streaming) {
                     streaming = NO;
@@ -230,8 +272,7 @@ NSString *const IOSPYDaemonVersion = @"0.1.5";
             case IOSPYMsgClipboardSet:
             case IOSPYMsgSystemAction:
             case IOSPYMsgKeyboardMode:
-                // Privileged interaction lives in the tweak, so hand it off, but
-                // only once the peer has proved it holds this session's token.
+            case IOSPYMsgUiDump:
                 if (!authenticated) {
                     [writeLock lock];
                     [self sendError:fd code:@"UNAUTHENTICATED" fatal:NO
@@ -239,7 +280,13 @@ NSString *const IOSPYDaemonVersion = @"0.1.5";
                     [writeLock unlock];
                     break;
                 }
-                [[IOSPYFrameIngest shared] forwardToTweak:hdr.type payload:payload];
+                if ([[IOSPYFrameIngest shared] tweakConnected]) {
+                    [[IOSPYFrameIngest shared] forwardToTweak:hdr.type payload:payload];
+                } else if (hdr.type == IOSPYMsgInputTouch) {
+                    IOSPYDaemonHandleTouchPayload(payload);
+                } else if (hdr.type == IOSPYMsgSystemAction) {
+                    IOSPYDaemonHandleSystemActionPayload(payload);
+                }
                 break;
             default:
                 break;
@@ -266,7 +313,13 @@ NSString *const IOSPYDaemonVersion = @"0.1.5";
 }
 
 - (NSDictionary *)capabilityMap {
+    IOSPYDiagRunSession();
     NSString *prefix = IOSPYJBPrefix();
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL hookDylib = [fm fileExistsAtPath:IOSPYPath(@"/usr/lib/TweakInject/ioscpyhook.dylib")] ||
+                     [fm fileExistsAtPath:IOSPYPath(@"/Library/MobileSubstrate/DynamicLibraries/ioscpyhook.dylib")];
+    BOOL hookLoaded =
+        [fm fileExistsAtPath:@"/var/mobile/Library/Preferences/com.ioscpy.hook.loaded"];
     return @{
         @"ios_version": IOSPYSystemVersion(),
         @"device_model": IOSPYDeviceModel(),
@@ -274,11 +327,13 @@ NSString *const IOSPYDaemonVersion = @"0.1.5";
         @"jb_prefix": prefix.length ? prefix : @"/",
         @"injection_framework": IOSPYInjectionFramework(),
         @"daemon_uid": @(getuid()),
-        // Backends are live whenever the tweak is attached. H.264 is preferred;
-        // if a device can't encode it the tweak streams MJPEG and the host follows
-        // the per-frame codec flag, so this stays a safe default.
-        @"stream_backends": [[IOSPYFrameIngest shared] tweakConnected] ? @[@"h264", @"mjpeg"] : @[],
-        @"input_backends": [[IOSPYFrameIngest shared] tweakConnected] ? @[@"iohid"] : @[],
+        @"hook_dylib": @(hookDylib),
+        @"hook_loaded": @(hookLoaded),
+        @"inject_error": IOSPYInjectLastError() ?: @"",
+        @"diagnostics": IOSPYDiagLines(),
+        @"diag_summary": IOSPYDiagSummary() ?: @"",
+        @"stream_backends": @[@"mjpeg"],
+        @"input_backends": @[@"iohid"],
         @"clipboard": @([[IOSPYFrameIngest shared] tweakConnected]),
         @"keyboard": @([[IOSPYFrameIngest shared] tweakConnected]),
         @"orientation": @NO,

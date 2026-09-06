@@ -1,32 +1,200 @@
 #import "Capture.h"
+#ifndef IOSPY_IN_DAEMON
 #import <UIKit/UIKit.h>
+#endif
 #import <IOSurface/IOSurfaceRef.h>
 #import <ImageIO/ImageIO.h>
 #import <MobileCoreServices/MobileCoreServices.h>
+#import <objc/message.h>
+#import <objc/runtime.h>
 #import <dlfcn.h>
+#import <mach/mach.h>
 
-// The render server can blit the live display straight into an IOSurface. It's
-// a long-standing private QuartzCore entry point; we resolve it at runtime so a
-// build of iOS that lacks it just reports "unavailable" instead of failing to
-// load.
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern mach_port_t bootstrap_port;
+kern_return_t bootstrap_look_up(mach_port_t bp, const char *service_name, mach_port_t *sp);
+#ifdef __cplusplus
+}
+#endif
+
+#ifndef MAX
+#define MAX(a, b) (((a) > (b)) ? (a) : (b))
+#endif
+
+static NSString *gCaptureNote = @"";
+
+NSString *IOSPYCaptureLastNote(void) {
+    return gCaptureNote ?: @"";
+}
+
+static void setCaptureNote(NSString *msg) {
+    gCaptureNote = msg ?: @"";
+    NSLog(@"[ioscpy] capture: %@", gCaptureNote);
+}
+
+#ifdef IOSPY_IN_DAEMON
+#import "SpringBoardLookup.h"
+#endif
+
+static int collectRenderClients(uint32_t *ids, int max) {
+    int n = 0;
+#ifdef IOSPY_IN_DAEMON
+    uint32_t sb = 0;
+    if (IOSPYSpringBoardRenderClient(&sb) && n < max) {
+        ids[n++] = sb;
+    }
+#endif
+    if (n < max) {
+        ids[n++] = 0;
+    }
+    const char *names[] = {"com.apple.CARenderServer", "com.apple.windowserver.active", NULL};
+    for (const char **s = names; *s && n < max; s++) {
+        mach_port_t port = MACH_PORT_NULL;
+        if (bootstrap_look_up(bootstrap_port, *s, &port) == KERN_SUCCESS && MACH_PORT_VALID(port)) {
+            ids[n++] = (uint32_t)port;
+        }
+    }
+    if (n < max) {
+        ids[n++] = 0xFFE;
+    }
+    return n;
+}
+
 typedef void (*CARenderServerRenderDisplayFn)(uint32_t client, CFStringRef display,
                                                IOSurfaceRef surface, int x, int y);
+typedef int (*IOMobileFramebufferGetMainDisplayFn)(void **fb);
+typedef int (*IOMobileFramebufferGetLayerDefaultSurfaceFn)(void *fb, int layer,
+                                                           IOSurfaceRef *surface);
 
 static CARenderServerRenderDisplayFn renderDisplayFn(void) {
     static CARenderServerRenderDisplayFn fn = NULL;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         fn = (CARenderServerRenderDisplayFn)dlsym(RTLD_DEFAULT, "CARenderServerRenderDisplay");
+        if (!fn) {
+            const char *paths[] = {
+                "/System/Library/Frameworks/QuartzCore.framework/QuartzCore",
+                "/System/Library/PrivateFrameworks/QuartzCore.framework/QuartzCore",
+                NULL,
+            };
+            for (const char **p = paths; *p; p++) {
+                void *h = dlopen(*p, RTLD_LAZY);
+                if (!h) {
+                    continue;
+                }
+                fn = (CARenderServerRenderDisplayFn)dlsym(h, "CARenderServerRenderDisplay");
+                if (fn) {
+                    break;
+                }
+            }
+        }
     });
     return fn;
 }
 
+static IOSurfaceRef mainFramebufferSurface(int *outWidth, int *outHeight) {
+    static IOMobileFramebufferGetMainDisplayFn getMain = NULL;
+    static IOMobileFramebufferGetLayerDefaultSurfaceFn getSurf = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        void *h = dlopen(
+            "/System/Library/PrivateFrameworks/IOMobileFramebuffer.framework/IOMobileFramebuffer",
+            RTLD_LAZY);
+        if (h) {
+            getMain = (IOMobileFramebufferGetMainDisplayFn)dlsym(h, "IOMobileFramebufferGetMainDisplay");
+            getSurf =
+                (IOMobileFramebufferGetLayerDefaultSurfaceFn)dlsym(h, "IOMobileFramebufferGetLayerDefaultSurface");
+        }
+    });
+    if (!getMain || !getSurf) {
+        return NULL;
+    }
+    void *fb = NULL;
+    if (getMain(&fb) != 0 || !fb) {
+        return NULL;
+    }
+    IOSurfaceRef surf = NULL;
+    for (int layer = 0; layer <= 3; layer++) {
+        IOSurfaceRef candidate = NULL;
+        if (getSurf(fb, layer, &candidate) == 0 && candidate) {
+            surf = candidate;
+            break;
+        }
+    }
+    if (!surf) {
+        return NULL;
+    }
+    if (outWidth) {
+        *outWidth = (int)IOSurfaceGetWidth(surf);
+    }
+    if (outHeight) {
+        *outHeight = (int)IOSurfaceGetHeight(surf);
+    }
+    return surf;
+}
+
 BOOL IOSPYCaptureAvailable(void) {
+    int w = 0, h = 0;
+    return renderDisplayFn() != NULL || mainFramebufferSurface(&w, &h) != NULL;
+}
+
+#ifdef IOSPY_IN_DAEMON
+BOOL IOSPYCaptureHasRenderFn(void) {
     return renderDisplayFn() != NULL;
 }
 
+void IOSPYCaptureProbeFramebuffer(int *outWidth, int *outHeight) {
+    mainFramebufferSurface(outWidth, outHeight);
+}
+#endif
+
 static double nowMs(void) {
     return CFAbsoluteTimeGetCurrent() * 1000.0;
+}
+
+// QuartzCore window-server size. Safe from a launchd daemon (no UIKit).
+static CGSize windowServerPixelSize(void) {
+    Class cls = NSClassFromString(@"CAWindowServer");
+    if (!cls) {
+        return CGSizeZero;
+    }
+    SEL running = sel_registerName("serverIfRunning");
+    if (![cls respondsToSelector:running]) {
+        return CGSizeZero;
+    }
+    id server = ((id (*)(id, SEL))objc_msgSend)(cls, running);
+    if (!server) {
+        return CGSizeZero;
+    }
+    NSArray *displays = [server valueForKey:@"displays"];
+    id display = displays.firstObject;
+    if (!display) {
+        return CGSizeZero;
+    }
+    CGSize sz = CGSizeZero;
+    id native = [display valueForKey:@"nativeSize"];
+    if ([native isKindOfClass:[NSValue class]]) {
+        [(NSValue *)native getValue:&sz];
+    }
+    if (sz.width < 2 || sz.height < 2) {
+        id boundsVal = [display valueForKey:@"bounds"];
+        CGRect bounds = CGRectZero;
+        if ([boundsVal isKindOfClass:[NSValue class]]) {
+            [(NSValue *)boundsVal getValue:&bounds];
+        }
+        CGFloat scale = 1;
+        id scaleVal = [display valueForKey:@"scale"];
+        if ([scaleVal respondsToSelector:@selector(doubleValue)]) {
+            scale = (CGFloat)[scaleVal doubleValue];
+            if (scale < 1) {
+                scale = 1;
+            }
+        }
+        sz = CGSizeMake(bounds.size.width * scale, bounds.size.height * scale);
+    }
+    return sz;
 }
 
 // Native screen size in pixels (cached; doesn't change at runtime).
@@ -34,15 +202,21 @@ static CGSize nativeScreenSize(void) {
     static CGSize size = {0, 0};
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        if ([NSThread isMainThread]) {
-            size = [UIScreen mainScreen].nativeBounds.size;
-        } else {
-            __block CGSize s = CGSizeZero;
-            dispatch_sync(dispatch_get_main_queue(), ^{
-                s = [UIScreen mainScreen].nativeBounds.size;
-            });
-            size = s;
+        int w = 0, h = 0;
+        if (mainFramebufferSurface(&w, &h) && w > 0 && h > 0) {
+            size = CGSizeMake(w, h);
+            return;
         }
+        CGSize ws = windowServerPixelSize();
+        if (ws.width > 1 && ws.height > 1) {
+            size = ws;
+            return;
+        }
+#ifdef IOSPY_IN_DAEMON
+        size = CGSizeZero;
+#else
+        size = [UIScreen mainScreen].nativeBounds.size;
+#endif
     });
     return size;
 }
@@ -80,11 +254,15 @@ static IOSurfaceRef surfaceForSize(int width, int height) {
         CFRelease(surface);
         surface = NULL;
     }
+    int bpr = width * 4;
     NSDictionary *props = @{
         (id)kIOSurfaceWidth: @(width),
         (id)kIOSurfaceHeight: @(height),
+        (id)kIOSurfaceBytesPerRow: @(bpr),
         (id)kIOSurfaceBytesPerElement: @4,
+        (id)kIOSurfaceAllocSize: @(bpr * height),
         (id)kIOSurfacePixelFormat: @((uint32_t)'BGRA'),
+        @"IOSurfaceIsGlobal": @YES,
     };
     surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
     cachedW = width;
@@ -104,11 +282,15 @@ static IOSurfaceRef destSurfaceForSize(int width, int height) {
         CFRelease(surface);
         surface = NULL;
     }
+    int bpr = width * 4;
     NSDictionary *props = @{
         (id)kIOSurfaceWidth: @(width),
         (id)kIOSurfaceHeight: @(height),
+        (id)kIOSurfaceBytesPerRow: @(bpr),
         (id)kIOSurfaceBytesPerElement: @4,
+        (id)kIOSurfaceAllocSize: @(bpr * height),
         (id)kIOSurfacePixelFormat: @((uint32_t)'BGRA'),
+        @"IOSurfaceIsGlobal": @YES,
     };
     surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
     cachedW = width;
@@ -193,101 +375,320 @@ IOSurfaceRef IOSPYCaptureScreenSurface(CGFloat maxDimension, int *outWidth, int 
     }
 }
 
+static NSData *jpegEncodeImage(CGImageRef image, CGFloat quality) {
+    if (!image) {
+        return nil;
+    }
+    NSMutableData *data = [NSMutableData data];
+    CGImageDestinationRef dest =
+        CGImageDestinationCreateWithData((__bridge CFMutableDataRef)data, CFSTR("public.jpeg"), 1, NULL);
+    if (!dest) {
+        return nil;
+    }
+    NSDictionary *options = @{(__bridge id)kCGImageDestinationLossyCompressionQuality: @(quality)};
+    CGImageDestinationAddImage(dest, image, (__bridge CFDictionaryRef)options);
+    BOOL ok = CGImageDestinationFinalize(dest);
+    CFRelease(dest);
+    return ok ? data : nil;
+}
+
+static NSData *jpegFromFramebuffer(CGFloat maxDimension, CGFloat quality, int *outWidth, int *outHeight,
+                                   double *outRenderMs, double *outEncodeMs) {
+    int nw = 0, nh = 0;
+    IOSurfaceRef surface = mainFramebufferSurface(&nw, &nh);
+    if (!surface || nw < 2 || nh < 2) {
+        return nil;
+    }
+    double renderStart = nowMs();
+    IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
+    void *base = IOSurfaceGetBaseAddress(surface);
+    size_t bytesPerRow = IOSurfaceGetBytesPerRow(surface);
+    CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+    const uint32_t bgra = kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little;
+    CGDataProviderRef provider = CGDataProviderCreateWithData(NULL, base, bytesPerRow * nh, NULL);
+    CGImageRef nativeImage = CGImageCreate(nw, nh, 8, 32, bytesPerRow, space, bgra, provider, NULL,
+                                           false, kCGRenderingIntentDefault);
+    CGFloat longest = (CGFloat)MAX(nw, nh);
+    int tw = nw, th = nh;
+    if (maxDimension > 0 && longest > maxDimension) {
+        CGFloat factor = maxDimension / longest;
+        tw = (int)round(nw * factor);
+        th = (int)round(nh * factor);
+    }
+    CGImageRef image = nativeImage;
+    CGContextRef ctx = NULL;
+    if (tw != nw || th != nh) {
+        ctx = CGBitmapContextCreate(NULL, tw, th, 8, 0, space, bgra);
+        if (ctx && nativeImage) {
+            CGContextSetInterpolationQuality(ctx, kCGInterpolationLow);
+            CGContextDrawImage(ctx, CGRectMake(0, 0, tw, th), nativeImage);
+            CGImageRef scaled = CGBitmapContextCreateImage(ctx);
+            CGImageRelease(nativeImage);
+            image = scaled;
+        }
+    }
+    if (outRenderMs) {
+        *outRenderMs = nowMs() - renderStart;
+    }
+    double encodeStart = nowMs();
+    NSData *jpeg = jpegEncodeImage(image, quality);
+    if (outEncodeMs) {
+        *outEncodeMs = nowMs() - encodeStart;
+    }
+    CGImageRelease(image);
+    if (ctx) {
+        CGContextRelease(ctx);
+    }
+    CGDataProviderRelease(provider);
+    IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+    CGColorSpaceRelease(space);
+    if (!jpeg) {
+        return nil;
+    }
+    if (outWidth) {
+        *outWidth = tw;
+    }
+    if (outHeight) {
+        *outHeight = th;
+    }
+    return jpeg;
+}
+
+static NSData *jpegFromRender(CARenderServerRenderDisplayFn render, CFStringRef display, int nw,
+                              int nh, CGFloat maxDimension, CGFloat quality, int *outWidth,
+                              int *outHeight, double *outRenderMs, double *outEncodeMs) {
+    if (!render || nw < 2 || nh < 2) {
+        return nil;
+    }
+    CGSize native = CGSizeMake(nw, nh);
+    CGSize target = native;
+    if (maxDimension > 0) {
+        CGFloat longest = MAX(native.width, native.height);
+        if (longest > maxDimension) {
+            CGFloat factor = maxDimension / longest;
+            target = CGSizeMake(round(native.width * factor), round(native.height * factor));
+        }
+    }
+    int tw = (int)target.width;
+    int th = (int)target.height;
+    IOSurfaceRef surface = surfaceForSize(nw, nh);
+    if (!surface) {
+        return nil;
+    }
+    const uint32_t bgra = kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little;
+    CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+    double renderStart = nowMs();
+    uint32_t clients[6];
+    int nClients = collectRenderClients(clients, 6);
+    BOOL painted = NO;
+    for (int ci = 0; ci < nClients && !painted; ci++) {
+        render(clients[ci], display, surface, 0, 0);
+        IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
+        void *probe = IOSurfaceGetBaseAddress(surface);
+        size_t bpr = IOSurfaceGetBytesPerRow(surface);
+        if (probe && nw > 2 && nh > 2) {
+            uint32_t *p = (uint32_t *)probe;
+            if (!(p[0] == 0 && p[(bpr / 4) * (nh / 2) + (nw / 2)] == 0 &&
+                  p[(bpr / 4) * (nh - 1) + (nw - 1)] == 0)) {
+                painted = YES;
+            }
+        }
+        IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+    }
+    if (!painted) {
+        CGColorSpaceRelease(space);
+        return nil;
+    }
+    IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
+    void *base = IOSurfaceGetBaseAddress(surface);
+    size_t bytesPerRow = IOSurfaceGetBytesPerRow(surface);
+    CGDataProviderRef provider = CGDataProviderCreateWithData(NULL, base, bytesPerRow * nh, NULL);
+    CGImageRef nativeImage = CGImageCreate(nw, nh, 8, 32, bytesPerRow, space, bgra, provider, NULL,
+                                           false, kCGRenderingIntentDefault);
+    CGContextRef ctx = CGBitmapContextCreate(NULL, tw, th, 8, 0, space, bgra);
+    CGImageRef image = NULL;
+    if (ctx && nativeImage) {
+        CGContextSetInterpolationQuality(ctx, kCGInterpolationLow);
+        CGContextDrawImage(ctx, CGRectMake(0, 0, tw, th), nativeImage);
+        image = CGBitmapContextCreateImage(ctx);
+    }
+    if (ctx) {
+        CGContextRelease(ctx);
+    }
+    CGImageRelease(nativeImage);
+    CGDataProviderRelease(provider);
+    IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+    CGColorSpaceRelease(space);
+    if (outRenderMs) {
+        *outRenderMs = nowMs() - renderStart;
+    }
+    if (!image) {
+        return nil;
+    }
+    double encodeStart = nowMs();
+    NSData *jpeg = jpegEncodeImage(image, quality);
+    CGImageRelease(image);
+    if (outEncodeMs) {
+        *outEncodeMs = nowMs() - encodeStart;
+    }
+    if (!jpeg) {
+        return nil;
+    }
+    if (outWidth) {
+        *outWidth = tw;
+    }
+    if (outHeight) {
+        *outHeight = th;
+    }
+    return jpeg;
+}
+
+#ifdef IOSPY_IN_DAEMON
+static NSData *jpegFromUIKitPrivate(CGFloat quality, int *outWidth, int *outHeight) {
+    dlopen("/System/Library/Frameworks/UIKit.framework/UIKit", RTLD_LAZY);
+    const char *syms[] = {"UIGetScreenImage", "_UICreateScreenUIImage", "UICreateScreenImage", NULL};
+    typedef CGImageRef (*UiFn)(void);
+    for (const char **s = syms; *s; s++) {
+        UiFn fn = (UiFn)dlsym(RTLD_DEFAULT, *s);
+        if (!fn) {
+            continue;
+        }
+        CGImageRef img = fn();
+        if (!img) {
+            continue;
+        }
+        int tw = (int)CGImageGetWidth(img);
+        int th = (int)CGImageGetHeight(img);
+        NSData *jpeg = jpegEncodeImage(img, quality);
+        CGImageRelease(img);
+        if (jpeg && tw > 1 && th > 1) {
+            if (outWidth) {
+                *outWidth = tw;
+            }
+            if (outHeight) {
+                *outHeight = th;
+            }
+            NSLog(@"[ioscpyd] screenshot via %s %dx%d", *s, tw, th);
+            return jpeg;
+        }
+    }
+    return nil;
+}
+
+static NSData *jpegFromSpringBoardServices(CGFloat quality, int *outWidth, int *outHeight) {
+    void *h = dlopen(
+        "/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices",
+        RTLD_LAZY);
+    if (!h) {
+        h = dlopen("/System/Library/PrivateFrameworks/ScreenshotServices.framework/ScreenshotServices",
+                   RTLD_LAZY);
+    }
+    const char *syms[] = {"SBSCopyScreenUIImage", "SBSScreenshotCopyImage", "_SBSCreateScreenshotImage",
+                          "SBSCreateImageFromIOSurface", NULL};
+    typedef CGImageRef (*SbsFn)(void);
+    for (const char **s = syms; *s; s++) {
+        SbsFn fn = (SbsFn)dlsym(h ? h : RTLD_DEFAULT, *s);
+        if (!fn) {
+            fn = (SbsFn)dlsym(RTLD_DEFAULT, *s);
+        }
+        if (!fn) {
+            continue;
+        }
+        CGImageRef img = fn();
+        if (!img) {
+            continue;
+        }
+        int tw = (int)CGImageGetWidth(img);
+        int th = (int)CGImageGetHeight(img);
+        NSData *jpeg = jpegEncodeImage(img, quality);
+        CGImageRelease(img);
+        if (jpeg && tw > 1 && th > 1) {
+            if (outWidth) {
+                *outWidth = tw;
+            }
+            if (outHeight) {
+                *outHeight = th;
+            }
+            NSLog(@"[ioscpyd] screenshot via %s %dx%d", *s, tw, th);
+            return jpeg;
+        }
+    }
+    return nil;
+}
+#endif
+
 NSData *IOSPYCaptureScreenJPEG(CGFloat maxDimension, CGFloat quality,
                                int *outWidth, int *outHeight,
                                double *outRenderMs, double *outEncodeMs) {
     @autoreleasepool {
+#ifdef IOSPY_IN_DAEMON
+        NSData *ui = jpegFromUIKitPrivate(quality, outWidth, outHeight);
+        if (ui) {
+            setCaptureNote(@"uikit");
+            return ui;
+        }
+        NSData *sbs = jpegFromSpringBoardServices(quality, outWidth, outHeight);
+        if (sbs) {
+            setCaptureNote(@"sbs");
+            return sbs;
+        }
+        NSData *fb = jpegFromFramebuffer(maxDimension, quality, outWidth, outHeight, outRenderMs,
+                                         outEncodeMs);
+        if (fb) {
+            setCaptureNote(@"framebuffer");
+            return fb;
+        }
         CARenderServerRenderDisplayFn render = renderDisplayFn();
         if (!render) {
+            setCaptureNote(@"CARenderServerRenderDisplay missing");
             return nil;
+        }
+        CGSize native = nativeScreenSize();
+        if (native.width > 1 && native.height > 1) {
+            NSData *jpeg = jpegFromRender(render, mainDisplayName(), (int)native.width,
+                                          (int)native.height, maxDimension, quality, outWidth,
+                                          outHeight, outRenderMs, outEncodeMs);
+            if (jpeg) {
+                setCaptureNote(@"ok");
+                return jpeg;
+            }
+        }
+        CFStringRef names[] = {CFSTR("LCD"), CFSTR("Main"), CFSTR("built-in"), NULL};
+        const int sizes[][2] = {{1170, 2532}, {828, 1792}, {1125, 2436}, {1284, 2778},
+                                {1242, 2688}, {1080, 2340}, {750, 1624}, {0, 0}};
+        for (CFStringRef *name = names; *name; name++) {
+            for (int i = 0; sizes[i][0]; i++) {
+                NSData *jpeg = jpegFromRender(render, *name, sizes[i][0], sizes[i][1], maxDimension,
+                                              quality, outWidth, outHeight, outRenderMs, outEncodeMs);
+                if (jpeg) {
+                    setCaptureNote(@"ok");
+                    return jpeg;
+                }
+            }
+        }
+        setCaptureNote([NSString stringWithFormat:@"no jpeg (size %.0fx%.0f render=%d)", native.width,
+                                                  native.height, render != NULL]);
+        return nil;
+#else
+        CARenderServerRenderDisplayFn render = renderDisplayFn();
+        if (!render) {
+            return jpegFromFramebuffer(maxDimension, quality, outWidth, outHeight, outRenderMs,
+                                       outEncodeMs);
         }
 
         CGSize native = nativeScreenSize();
         if (native.width < 1 || native.height < 1) {
-            return nil;
+            return jpegFromFramebuffer(maxDimension, quality, outWidth, outHeight, outRenderMs,
+                                       outEncodeMs);
         }
-        int nw = (int)native.width;
-        int nh = (int)native.height;
-
-        // The render server blits 1:1 and clips to the surface, so capture the
-        // whole screen at native size, then downscale the concrete pixels.
-        CGSize target = native;
-        if (maxDimension > 0) {
-            CGFloat longest = MAX(native.width, native.height);
-            if (longest > maxDimension) {
-                CGFloat factor = maxDimension / longest;
-                target = CGSizeMake(round(native.width * factor), round(native.height * factor));
-            }
+        NSData *jpeg = jpegFromRender(render, mainDisplayName(), (int)native.width, (int)native.height,
+                                      maxDimension, quality, outWidth, outHeight, outRenderMs,
+                                      outEncodeMs);
+        if (jpeg) {
+            return jpeg;
         }
-        int tw = (int)target.width;
-        int th = (int)target.height;
-
-        IOSurfaceRef surface = surfaceForSize(nw, nh);
-        if (!surface) {
-            return nil;
-        }
-
-        const uint32_t bgra = kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little;
-        CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
-
-        double renderStart = nowMs();
-        render(0, mainDisplayName(), surface, 0, 0);
-
-        IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
-        void *base = IOSurfaceGetBaseAddress(surface);
-        size_t bytesPerRow = IOSurfaceGetBytesPerRow(surface);
-
-        // Wrap the surface memory without copying, then draw it (downscaled, cheap
-        // interpolation) into the target bitmap.
-        CGDataProviderRef provider = CGDataProviderCreateWithData(NULL, base, bytesPerRow * nh, NULL);
-        CGImageRef nativeImage = CGImageCreate(nw, nh, 8, 32, bytesPerRow, space, bgra, provider,
-                                               NULL, false, kCGRenderingIntentDefault);
-        CGContextRef ctx = CGBitmapContextCreate(NULL, tw, th, 8, 0, space, bgra);
-        CGImageRef image = NULL;
-        if (ctx && nativeImage) {
-            CGContextSetInterpolationQuality(ctx, kCGInterpolationLow);
-            CGContextDrawImage(ctx, CGRectMake(0, 0, tw, th), nativeImage);
-            image = CGBitmapContextCreateImage(ctx);
-        }
-        if (ctx) {
-            CGContextRelease(ctx);
-        }
-        CGImageRelease(nativeImage);
-        CGDataProviderRelease(provider);
-        IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
-        CGColorSpaceRelease(space);
-        if (outRenderMs) {
-            *outRenderMs = nowMs() - renderStart;
-        }
-        if (!image) {
-            return nil;
-        }
-
-        double encodeStart = nowMs();
-        NSMutableData *data = [NSMutableData data];
-        CGImageDestinationRef dest =
-            CGImageDestinationCreateWithData((__bridge CFMutableDataRef)data, kUTTypeJPEG, 1, NULL);
-        BOOL ok = NO;
-        if (dest) {
-            NSDictionary *options = @{(__bridge id)kCGImageDestinationLossyCompressionQuality: @(quality)};
-            CGImageDestinationAddImage(dest, image, (__bridge CFDictionaryRef)options);
-            ok = CGImageDestinationFinalize(dest);
-            CFRelease(dest);
-        }
-        CGImageRelease(image);
-        if (outEncodeMs) {
-            *outEncodeMs = nowMs() - encodeStart;
-        }
-
-        if (!ok) {
-            return nil;
-        }
-        if (outWidth) {
-            *outWidth = tw;
-        }
-        if (outHeight) {
-            *outHeight = th;
-        }
-        return data;
+        return jpegFromFramebuffer(maxDimension, quality, outWidth, outHeight, outRenderMs,
+                                   outEncodeMs);
+#endif
     }
 }

@@ -18,6 +18,11 @@ Desktop.ini
 .vscode/
 .idea/
 
+# Local Windows host binaries / tools (not for GitHub)
+/bin/
+*.exe
+*.dll
+
 # Secrets
 *.pem
 id_rsa*

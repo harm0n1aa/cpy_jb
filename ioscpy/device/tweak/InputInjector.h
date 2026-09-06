@@ -25,6 +25,11 @@ void IOSPYSystemAction(uint16_t action);
 // already resolved its layout, so these are the literal characters to enter.
 void IOSPYTypeText(NSString *text);
 
+// Listen in every UIKit process for unicode the SpringBoard hook broadcasts.
+// ASCII still goes out as HID from SpringBoard; Cyrillic and friends are
+// inserted into the first responder so they don't take a clipboard-paste detour.
+void IOSPYTextInjectionStart(void);
+
 // A non-text key / editing action (codes match the host KeyCode enum:
 // 1=Enter 2=Backspace 3=Tab 4=Escape 5=Left 6=Right 7=Up 8=Down,
 // 10=SelectAll 11=Copy 12=Paste 13=Cut 14=Undo).

@@ -1,6 +1,7 @@
 #import "FrameIngest.h"
 #import "FrameStore.h"
 #import "Protocol.h"
+#import "DaemonCapture.h"
 
 #import <sys/socket.h>
 #import <netinet/in.h>
@@ -17,6 +18,8 @@
     int _hostFd;        // the control server's host socket, -1 when none
     NSLock *_hostLock;  // the control server's per-connection write lock
     BOOL _videoReliable; // YES while an H.264 stream needs in-order delivery
+    BOOL _wantStream;   // host asked to stream; replay if the tweak attaches late
+    uint8_t _wantCodec;
 }
 
 + (instancetype)shared {
@@ -93,9 +96,21 @@
             close(_tweakFd);
         }
         _tweakFd = client;
+        BOOL want = _wantStream;
+        uint8_t codec = _wantCodec;
         [_writeLock unlock];
 
         NSLog(@"[ioscpyd] tweak attached to frame channel");
+        [[IOSPYDaemonCapture shared] stop];
+        if (want) {
+            NSData *p = [NSData dataWithBytes:&codec length:1];
+            [_writeLock lock];
+            if (_tweakFd == client) {
+                IOSPYWriteFrame(_tweakFd, IOSPYMsgStartStream, IOSPY_CHANNEL_CONTROL, 0, p);
+                NSLog(@"[ioscpyd] replayed StartStream to late tweak (codec=%u)", codec);
+            }
+            [_writeLock unlock];
+        }
         [self readFramesFrom:client];
 
         [_writeLock lock];
@@ -105,6 +120,12 @@
         [_writeLock unlock];
         close(client);
         NSLog(@"[ioscpyd] tweak detached from frame channel");
+        [_writeLock lock];
+        BOOL wantAgain = _wantStream;
+        [_writeLock unlock];
+        if (wantAgain) {
+            [[IOSPYDaemonCapture shared] start];
+        }
     }
 }
 
@@ -150,7 +171,8 @@
                     // MJPEG: keep only the latest frame, the pump drops stale ones.
                     [[IOSPYFrameStore shared] setPayload:payload];
                 }
-            } else if (header.type == IOSPYMsgClipboardChanged) {
+            } else if (header.type == IOSPYMsgClipboardChanged ||
+                       header.type == IOSPYMsgUiDumpResult) {
                 // Relay tweak->host (e.g. device clipboard changed) on the host's
                 // control socket, serialized with the video pump's writes.
                 int hostFd;
@@ -161,10 +183,11 @@
                 }
                 if (hostFd >= 0 && hostLock) {
                     [hostLock lock];
-                    // Non-blocking: a clipboard frame is best-effort, not worth
-                    // stalling the ingest thread (and the tweak behind it) over.
-                    IOSPYTryWriteFrame(hostFd, IOSPYMsgClipboardChanged, IOSPY_CHANNEL_CONTROL, 0,
-                                       payload);
+                    if (header.type == IOSPYMsgUiDumpResult) {
+                        IOSPYWriteFrame(hostFd, IOSPYMsgUiDumpResult, IOSPY_CHANNEL_CONTROL, 0, payload);
+                    } else {
+                        IOSPYTryWriteFrame(hostFd, IOSPYMsgClipboardChanged, IOSPY_CHANNEL_CONTROL, 0, payload);
+                    }
                     [hostLock unlock];
                 }
             }
@@ -181,15 +204,26 @@
 
 - (void)tellTweakStartCodec:(uint8_t)codec {
     [_writeLock lock];
+    _wantStream = YES;
+    _wantCodec = codec;
     if (_tweakFd >= 0) {
         NSData *p = [NSData dataWithBytes:&codec length:1];
         IOSPYWriteFrame(_tweakFd, IOSPYMsgStartStream, IOSPY_CHANNEL_CONTROL, 0, p);
+    } else {
+        NSLog(@"[ioscpyd] StartStream queued, tweak not attached yet");
+        [[IOSPYDaemonCapture shared] start];
     }
     [_writeLock unlock];
 }
 
 - (void)tellTweakStop {
-    [self sendToTweak:IOSPYMsgStopStream];
+    [_writeLock lock];
+    _wantStream = NO;
+    if (_tweakFd >= 0) {
+        IOSPYWriteFrame(_tweakFd, IOSPYMsgStopStream, IOSPY_CHANNEL_CONTROL, 0, nil);
+    }
+    [_writeLock unlock];
+    [[IOSPYDaemonCapture shared] stop];
 }
 
 - (void)sendToTweak:(IOSPYMessageType)type {

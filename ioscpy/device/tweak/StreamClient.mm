@@ -4,6 +4,7 @@
 #import "Protocol.h"
 #import "InputInjector.h"
 #import "KeyboardSuppression.h"
+#import "UiDump.h"
 
 #import <sys/socket.h>
 #import <netinet/in.h>
@@ -144,7 +145,9 @@ static uint64_t clipHash(NSString *t) {
             pb.string = text;
         }
         if (paste) {
-            IOSPYKeyAction(12); // Cmd+V; IOSPYKeyAction hops to the main queue itself
+            // Insert the text directly. Cmd+V was adding spaces and lag on
+            // Cyrillic because iOS treats each paste as a clipboard drop.
+            IOSPYTypeText(text);
         }
     });
 }
@@ -254,10 +257,18 @@ static uint64_t clipHash(NSString *t) {
                 [self applyRemoteClipboard:text paste:(flags & 0x01) != 0];
             }
         } else if (header.type == IOSPYMsgKeyboardMode && payload.length >= 1) {
-            // Hide/restore the on-screen keyboard. On the main thread (UIKit reads
-            // the flag there) and only touched from main, so no races.
             BOOL on = ((const uint8_t *)payload.bytes)[0] != 0;
             dispatch_async(dispatch_get_main_queue(), ^{ IOSPYSetKeyboardSuppressed(on); });
+        } else if (header.type == IOSPYMsgUiDump) {
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                NSData *json = IOSPYPerformUiDump();
+                dispatch_async(self->_captureQueue, ^{
+                    int out = self->_fd;
+                    if (out >= 0) {
+                        IOSPYWriteFrame(out, IOSPYMsgUiDumpResult, IOSPY_CHANNEL_CONTROL, 0, json);
+                    }
+                });
+            });
         }
       }
     }
