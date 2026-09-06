@@ -68,7 +68,7 @@ static void IOSPYWriteHookMarker(void) {
         if (!f) {
             continue;
         }
-        fputs("0.1.29\n", f);
+        fputs("0.1.30\n", f);
         fclose(f);
     }
 }
@@ -76,7 +76,7 @@ static void IOSPYWriteHookMarker(void) {
 __attribute__((constructor)) static void IOSPYTweakInit(void) {
     IOSPYWriteHookMarker();
     @autoreleasepool {
-        NSLog(@"[ioscpyhook] loaded (v0.1.29)");
+        NSLog(@"[ioscpyhook] loaded (v0.1.30)");
         NSOperatingSystemVersion v = [[NSProcessInfo processInfo] operatingSystemVersion];
         gSuppressPasteAlert = (v.majorVersion >= 16);
         // Never touch UIApplication in the constructor — ElleKit may unload us.

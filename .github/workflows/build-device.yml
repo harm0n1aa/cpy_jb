@@ -69,26 +69,32 @@ jobs:
           echo "version=$v" >> "$GITHUB_OUTPUT"
           echo "Building com.ioscpy.device $v"
 
-      - name: Build roothide .deb (arm64 + arm64e)
+      - name: Build rootless .deb (arm64 + arm64e)
         working-directory: ioscpy/device
         env:
           THEOS: ${{ github.workspace }}/.theos-roothide
         run: |
           # Windows checkouts often drop +x on maintainer scripts; dpkg rejects that.
           chmod 755 layout/DEBIAN/postinst layout/DEBIAN/prerm 2>/dev/null || true
-          # Override ARCHS on the CLI so local/QEMU Linux builds can stay arm64-only.
-          # Pin SDK so "latest" does not pick a bare Xcode SDK without stubs.
+          # Dopamine rootless uses /var/jb — MUST use rootless scheme or dpkg tries
+          # to write /usr/bin on the real (read-only) root.
           gmake clean || true
           gmake package FINALPACKAGE=1 \
-            THEOS_PACKAGE_SCHEME=roothide \
+            THEOS_PACKAGE_SCHEME=rootless \
             THEOS_PACKAGE_ARCH=iphoneos-arm64 \
             ARCHS="arm64 arm64e" \
             TARGET="iphone:clang:16.5:14.0"
           ls -la packages
-          # Theos sometimes still stamps arm64e into the control; rewrite for Dopamine/Sileo.
           for deb in packages/*.deb; do
             arch=$(dpkg-deb -f "$deb" Architecture || true)
             echo "built $deb arch=$arch"
+            echo "package contents (first 40):"
+            dpkg-deb -c "$deb" | head -n 40 || true
+            if ! dpkg-deb -c "$deb" | grep -q 'var/jb/usr/bin/ioscpyd'; then
+              echo "ERROR: rootless package must contain var/jb/usr/bin/ioscpyd"
+              dpkg-deb -c "$deb" | head -n 80
+              exit 1
+            fi
             if [ "$arch" != "iphoneos-arm64" ]; then
               tmp=$(mktemp -d)
               dpkg-deb -R "$deb" "$tmp"
@@ -102,6 +108,10 @@ jobs:
               if [ "$out" != "$deb" ]; then rm -f "$deb"; fi
               echo "rewrote -> $out"
               dpkg-deb -f "$out" Architecture Version Package
+              if ! dpkg-deb -c "$out" | grep -q 'var/jb/usr/bin/ioscpyd'; then
+                echo "ERROR: rewrite lost var/jb paths"
+                exit 1
+              fi
             fi
           done
           find .theos -name 'ioscpyhook.dylib' -print -exec lipo -info {} \;
@@ -148,11 +158,11 @@ jobs:
           name: ioscpy device ${{ steps.ver.outputs.version }} (arm64+arm64e)
           overwrite_files: true
           body: |
-            Mac-built package with **arm64 + arm64e** (for iPhone 12 / A14).
+            Mac-built **rootless** package (`/var/jb`) with **arm64 + arm64e**.
 
             ## Sileo
-            Add source: `https://harm0n1aa.github.io/`
-            (also mirrors at `https://harm0n1aa.github.io/cpy_jb/`)
+            Prefer LAN: `http://192.168.1.8:8081`
+            Or: `https://harm0n1aa.github.io/`
             Then search **ioscpy** → Install → Restart SpringBoard.
           files: |
             ioscpy/device/packages/*.deb
