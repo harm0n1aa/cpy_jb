@@ -74,7 +74,7 @@ jobs:
             THEOS_PACKAGE_SCHEME=roothide \
             THEOS_PACKAGE_ARCH=iphoneos-arm64 \
             ARCHS="arm64 arm64e" \
-            TARGET="iphone:clang:16.5:14.0"
+            TARGET="iphone:clang:15.0:14.0"
           ls -la packages
           # Theos sometimes still stamps arm64e into the control; rewrite for Dopamine/Sileo.
           for deb in packages/*.deb; do
@@ -101,10 +101,16 @@ jobs:
         working-directory: ioscpy/device
         run: |
           set -euo pipefail
-          DY=$(find .theos packages -name 'ioscpyhook.dylib' | head -n1)
+          DY=$(find .theos -name 'ioscpyhook.dylib' | head -n1)
           echo "hook: $DY"
           lipo -info "$DY"
           lipo -info "$DY" | grep -q arm64e
+          # Fail the build if Xcode reintroduced NSConstant* (breaks load on device).
+          nm -u "$DY" | tee /tmp/ioscpy-undef.txt
+          if grep -E 'NSConstant(IntegerNumber|DoubleNumber|Dictionary|Array)' /tmp/ioscpy-undef.txt; then
+            echo "ERROR: NSConstant* undefined symbols will prevent ElleKit load"
+            exit 1
+          fi
 
       - name: Build apt repo for Sileo
         run: |

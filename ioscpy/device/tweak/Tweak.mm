@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
-#import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <stdio.h>
+#import <unistd.h>
 
 #import "StreamClient.h"
 #import "InputInjector.h"
@@ -55,19 +56,31 @@ static void IOSPYInstallPasteHook(void) {
     method_setImplementation(m, (IMP)IOSPYActivateAlertItem);
 }
 
+static void IOSPYWriteHookMarker(void) {
+    // Pure C — no ObjC / UIKit. If this file appears, ElleKit loaded our dylib.
+    const char *paths[] = {
+        "/var/mobile/Library/Preferences/com.ioscpy.hook.loaded",
+        "/tmp/com.ioscpy.hook.loaded",
+        NULL,
+    };
+    for (const char **p = paths; *p; p++) {
+        FILE *f = fopen(*p, "w");
+        if (!f) {
+            continue;
+        }
+        fputs("0.1.28\n", f);
+        fclose(f);
+    }
+}
+
 __attribute__((constructor)) static void IOSPYTweakInit(void) {
+    IOSPYWriteHookMarker();
     @autoreleasepool {
-        NSLog(@"[ioscpyhook] loaded (v0.1.27)");
-        NSString *dir = @"/var/mobile/Library/Preferences";
-        NSString *marker = [dir stringByAppendingPathComponent:@"com.ioscpy.hook.loaded"];
-        [@"1" writeToFile:marker atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        NSLog(@"[ioscpyhook] loaded (v0.1.28)");
         NSOperatingSystemVersion v = [[NSProcessInfo processInfo] operatingSystemVersion];
         gSuppressPasteAlert = (v.majorVersion >= 16);
-        // Constructor runs while SpringBoard is still coming up. Touching UIKit /
-        // sockets here is a common reason ElleKit unloads the dylib with no crash.
-        int64_t delayNs = [UIApplication sharedApplication] ? (int64_t)(0.2 * NSEC_PER_SEC)
-                                                            : (int64_t)(2 * NSEC_PER_SEC);
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delayNs),
+        // Never touch UIApplication in the constructor — ElleKit may unload us.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
                            [[IOSPYStreamClient shared] start];
                            IOSPYInstallPasteHook();

@@ -116,8 +116,8 @@ void IOSPYDiagRunSession(void) {
 
     if (!hookMarker && !tweakSock) {
         IOSPYDiag(@"── почему нет картинки ──");
-        IOSPYDiag(@"• твик arm64, SpringBoard arm64e → ElleKit часто молча пропускает");
-        IOSPYDiag(@"• инжект dlopen из демона — запасной путь, не всегда работает");
+        IOSPYDiag(@"• dylib есть, но ctor не бежал — ElleKit не смог dlopen (символы/подпись/путь)");
+        IOSPYDiag(@"• после install в Sileo нужен Restart SpringBoard, не только Готово");
         IOSPYDiag(@"• кадр идёт через CARenderServer из bootstrap SpringBoard");
         if (!renderFn) {
             IOSPYDiag(@"✗ нет CARenderServerRenderDisplay — пакет сломан");

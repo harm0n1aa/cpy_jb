@@ -74,7 +74,7 @@ def packages_entry(deb_name: str, data: bytes, fields: dict[str, str]) -> str:
         f"Section: {section}\n"
         f"Depends: {depends}\n"
         f"Description: {desc}\n"
-        f"Filename: ./{deb_name}\n"
+        f"Filename: {deb_name}\n"
         f"Size: {len(data)}\n"
         f"MD5sum: {sha(data, 'md5')}\n"
         f"SHA1: {sha(data, 'sha1')}\n"
