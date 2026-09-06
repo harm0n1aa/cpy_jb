@@ -47,6 +47,8 @@ struct Live {
     diag: Arc<Mutex<Vec<String>>>,
     got_frame: bool,
     auto: Job,
+    /// Kept after «стоп», so the last run stays copyable.
+    action_log: Vec<String>,
     dump: Option<Dump>,
     profiles: Vec<String>,
 }
@@ -219,6 +221,7 @@ impl AutoApp {
             status: "подключение…".into(),
             got_frame: false,
             auto: Job::idle(),
+            action_log: Vec::new(),
             dump: None,
             profiles: Vec::new(),
         });
@@ -280,14 +283,35 @@ fn pump_live(ctx: &egui::Context, live: &mut Live, profile: &mut String) {
         } else if kind == MessageType::UiDumpResult {
             if let Some(dump) = Dump::parse(&payload) {
                 let profiles = dump.profiles();
-                if !profiles.is_empty() {
-                    live.profiles = profiles;
-                    if profile.is_empty() && !live.profiles.is_empty() {
-                        *profile = live.profiles[0].clone();
+                if dump.is_container() {
+                    if !profiles.is_empty() {
+                        live.profiles = profiles;
+                        if profile.is_empty() && !live.profiles.is_empty() {
+                            *profile = live.profiles[0].clone();
+                        }
                     }
+                } else if dump.is_springboard() {
+                    // Drop stale SpringBoard junk that older builds stuffed into the combo.
+                    live.profiles.retain(|p| {
+                        let t = p.trim();
+                        !t.contains("com.")
+                            && !t.contains("apple.")
+                            && t.chars().count() >= 3
+                            && !matches!(
+                                t,
+                                "Поиск" | "Погода" | "Календарь" | "Page control" | "spotlight-pill"
+                            )
+                    });
                 }
                 live.auto.dump_arrived();
+                live.auto.note_dump(&dump);
+                if !live.auto.running() {
+                    live.action_log = live.auto.log_lines().to_vec();
+                }
                 live.dump = Some(dump);
+                if live.status == "читаю UI…" {
+                    live.status = "UI считан — смотри автолог".into();
+                }
             }
         }
     }
@@ -409,10 +433,12 @@ fn draw_panel(ui: &mut Ui, app: &mut AutoApp) {
                             let auto_l = if live.auto.running() { "стоп" } else { "авто" };
                             if accent(ui, auto_l).clicked() {
                                 if live.auto.running() {
+                                    live.action_log = live.auto.log_lines().to_vec();
                                     live.auto = Job::idle();
                                     live.status = "в эфире".into();
                                 } else {
                                     live.dump = None;
+                                    live.action_log.clear();
                                     live.auto = Job::start(
                                         &app.lock_pin,
                                         &app.app_pin,
@@ -440,11 +466,19 @@ fn draw_panel(ui: &mut Ui, app: &mut AutoApp) {
                         );
                         let diag_lines: Vec<String> =
                             live.diag.lock().map(|g| g.clone()).unwrap_or_default();
+                        let auto_lines: Vec<String> = {
+                            let cur = live.auto.log_lines();
+                            if !cur.is_empty() {
+                                cur.to_vec()
+                            } else {
+                                live.action_log.clone()
+                            }
+                        };
                         if !diag_lines.is_empty() {
                             ui.add_space(6.0);
                             ui.horizontal(|ui| {
                                 ui.label(
-                                    egui::RichText::new("диагностика").size(11.0).color(MUTED),
+                                    egui::RichText::new("телефон").size(11.0).color(MUTED),
                                 );
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
@@ -470,7 +504,50 @@ fn draw_panel(ui: &mut Ui, app: &mut AutoApp) {
                             let text = diag_lines.join("\n");
                             egui::ScrollArea::vertical()
                                 .id_salt("diag")
-                                .max_height(220.0)
+                                .max_height(120.0)
+                                .show(ui, |ui| {
+                                    let mut buf = text;
+                                    ui.add(
+                                        egui::TextEdit::multiline(&mut buf)
+                                            .font(FontId::monospace(11.0))
+                                            .desired_width(f32::INFINITY)
+                                            .text_color(TEXT)
+                                            .frame(false),
+                                    );
+                                });
+                        }
+                        if !auto_lines.is_empty() {
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("автолог").size(11.0).color(MUTED),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .add(
+                                                egui::Button::new(
+                                                    egui::RichText::new("копировать")
+                                                        .size(11.0)
+                                                        .color(ACCENT),
+                                                )
+                                                .fill(Color32::TRANSPARENT)
+                                                .stroke(Stroke::NONE),
+                                            )
+                                            .clicked()
+                                        {
+                                            ui.ctx().copy_text(auto_lines.join("\n"));
+                                            live.status = "автолог скопирован".into();
+                                        }
+                                    },
+                                );
+                            });
+                            let text = auto_lines.join("\n");
+                            egui::ScrollArea::vertical()
+                                .id_salt("autolog")
+                                .max_height(260.0)
+                                .stick_to_bottom(true)
                                 .show(ui, |ui| {
                                     let mut buf = text;
                                     ui.add(
