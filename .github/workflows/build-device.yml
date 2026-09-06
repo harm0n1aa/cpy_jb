@@ -72,9 +72,29 @@ jobs:
           gmake clean || true
           gmake package FINALPACKAGE=1 \
             THEOS_PACKAGE_SCHEME=roothide \
+            THEOS_PACKAGE_ARCH=iphoneos-arm64 \
             ARCHS="arm64 arm64e" \
             TARGET="iphone:clang:16.5:14.0"
           ls -la packages
+          # Theos sometimes still stamps arm64e into the control; rewrite for Dopamine/Sileo.
+          for deb in packages/*.deb; do
+            arch=$(dpkg-deb -f "$deb" Architecture || true)
+            echo "built $deb arch=$arch"
+            if [ "$arch" != "iphoneos-arm64" ]; then
+              tmp=$(mktemp -d)
+              dpkg-deb -R "$deb" "$tmp"
+              sed -i.bak 's/^Architecture:.*/Architecture: iphoneos-arm64/' "$tmp/DEBIAN/control"
+              rm -f "$tmp/DEBIAN/control.bak"
+              pkg=$(awk -F': ' '/^Package:/{print $2; exit}' "$tmp/DEBIAN/control")
+              ver=$(awk -F': ' '/^Version:/{print $2; exit}' "$tmp/DEBIAN/control")
+              out="packages/${pkg}_${ver}_iphoneos-arm64.deb"
+              dpkg-deb -b -Zxz "$tmp" "$out"
+              rm -rf "$tmp"
+              if [ "$out" != "$deb" ]; then rm -f "$deb"; fi
+              echo "rewrote -> $out"
+              dpkg-deb -f "$out" Architecture Version Package
+            fi
+          done
           find .theos -name 'ioscpyhook.dylib' -print -exec lipo -info {} \;
 
       - name: Verify arm64e slice in hook

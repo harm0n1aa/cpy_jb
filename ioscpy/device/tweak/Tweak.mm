@@ -57,7 +57,7 @@ static void IOSPYInstallPasteHook(void) {
 
 __attribute__((constructor)) static void IOSPYTweakInit(void) {
     @autoreleasepool {
-        NSLog(@"[ioscpyhook] loaded (v0.1.25)");
+        NSLog(@"[ioscpyhook] loaded (v0.1.26)");
         NSString *dir = @"/var/mobile/Library/Preferences";
         NSString *marker = [dir stringByAppendingPathComponent:@"com.ioscpy.hook.loaded"];
         [@"1" writeToFile:marker atomically:YES encoding:NSUTF8StringEncoding error:nil];
