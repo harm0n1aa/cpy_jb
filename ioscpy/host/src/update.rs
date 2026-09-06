@@ -7,7 +7,6 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -109,7 +108,7 @@ pub fn refresh_in_background() {
 
 /// Pull the latest release tag from GitHub with curl. None on any failure.
 fn fetch_latest_tag() -> Option<String> {
-    let out = Command::new("curl")
+    let out = crate::platform::hidden_command("curl")
         .args(["-fsSL", "--max-time", "3", "-A", "ioscpy", LATEST_URL])
         .output()
         .ok()?;

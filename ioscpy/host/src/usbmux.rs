@@ -5,7 +5,7 @@
 //! (`start` / `connect` / `local_port`) wouldn't change.
 
 use std::net::{TcpListener, TcpStream};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -46,7 +46,7 @@ impl UsbForward {
 
         let iproxy = crate::platform::tool_path("iproxy")
             .ok_or_else(|| anyhow::anyhow!("{}", crate::platform::missing_tools_hint()))?;
-        let mut child = Command::new(&iproxy)
+        let mut child = crate::platform::hidden_command(&iproxy)
             .arg(&pair)
             .arg("-u")
             .arg(udid)

@@ -1,41 +1,41 @@
 @echo off
-setlocal EnableDelayedExpansion
-set "PATH=S:\programms\cpy_jb\tools\libimobiledevice;%PATH%"
-set "IOSCPY=S:\programms\cpy_jb\ioscpy\host\target\release\ioscpy.exe"
+setlocal
+cd /d "%~dp0"
 
-if /i "%~1"=="--list" (
-  "%IOSCPY%" %*
-  exit /b %ERRORLEVEL%
+set "ROOT=%~dp0"
+if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
+set "PATH=%ROOT%\bin;%ROOT%\tools\libimobiledevice;%PATH%"
+
+set "IOSCPY=%ROOT%\bin\ioscpy.exe"
+if not exist "%IOSCPY%" set "IOSCPY=%ROOT%\ioscpy\host\target\release\ioscpy.exe"
+
+if not exist "%IOSCPY%" (
+  echo ioscpy.exe is missing - Defender may have removed it. Building...
+  call "%ROOT%\build-host.bat"
+  set "IOSCPY=%ROOT%\bin\ioscpy.exe"
 )
 
-echo %*| findstr /i /c:"--device" >nul
-if not errorlevel 1 (
-  "%IOSCPY%" %*
-  exit /b %ERRORLEVEL%
-)
+if not exist "%IOSCPY%" set "IOSCPY=%ROOT%\ioscpy\host\target\release\ioscpy.exe"
 
-set "UDIDS="
-set COUNT=0
-for /f "usebackq tokens=1" %%U in (`idevice_id -l 2^>nul`) do (
-  set /a COUNT+=1
-  set "UDIDS=!UDIDS! %%U"
-)
-
-if !COUNT! EQU 0 (
-  echo No iPhone found over USB. Plug in a jailbroken iPhone, unlock it, and tap Trust if asked.
+if not exist "%IOSCPY%" (
+  echo ioscpy.exe is still missing.
+  echo Allow the folder in Windows Security exclusions, then run build-host.bat.
   pause
   exit /b 1
 )
 
-if !COUNT! EQU 1 (
-  echo Connecting to!UDIDS!
-  "%IOSCPY%" --device!UDIDS! %*
-  exit /b %ERRORLEVEL%
-)
+REM Keep the console for diagnostics. Everything else is the GUI window.
+if /i "%~1"=="--list" goto :console
+if /i "%~1"=="--debug" goto :console
+if /i "%~1"=="--handshake-only" goto :console
+if /i "%~1"=="--snapshot" goto :console
+if /i "%~1"=="--bench" goto :console
+if /i "%~1"=="--action" goto :console
+if /i "%~1"=="--soak" goto :console
 
-echo Found !COUNT! iPhones. Opening a window for each...
-for %%U in (!UDIDS!) do (
-  echo   %%U
-  start "ioscpy %%U" "%IOSCPY%" --device %%U %*
-)
+start "" "%IOSCPY%" %*
+exit /b 0
+
+:console
+"%IOSCPY%" %*
 endlocal

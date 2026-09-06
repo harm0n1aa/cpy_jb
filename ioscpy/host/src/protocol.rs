@@ -71,6 +71,10 @@ pub enum MessageType {
     Pong = 61,
     Error = 70,
     Log = 71,
+    /// Host asks the tweak for the foreground UI tree (labels + frames).
+    UiDump = 80,
+    /// JSON `{ bundle, nodes: [{ text, id, class, x, y, w, h }] }`.
+    UiDumpResult = 81,
 }
 
 impl MessageType {
@@ -100,6 +104,8 @@ impl MessageType {
             61 => Pong,
             70 => Error,
             71 => Log,
+            80 => UiDump,
+            81 => UiDumpResult,
             _ => return None,
         })
     }
@@ -256,6 +262,16 @@ pub struct Capabilities {
     pub injection_framework: String,
     #[serde(default)]
     pub daemon_uid: i64,
+    #[serde(default)]
+    pub hook_dylib: bool,
+    #[serde(default)]
+    pub hook_loaded: bool,
+    #[serde(default)]
+    pub inject_error: String,
+    #[serde(default)]
+    pub diagnostics: Vec<String>,
+    #[serde(default)]
+    pub diag_summary: String,
     #[serde(default)]
     pub stream_backends: Vec<String>,
     #[serde(default)]

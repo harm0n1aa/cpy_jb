@@ -17,7 +17,7 @@ pub const WIDTH: usize = 56;
 
 const ROWS: usize = 10;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
     Home,
     Lock,
@@ -180,6 +180,12 @@ struct IconSet {
 /// Decodes all ten bundled icons once, on first sidebar draw, and keeps them
 /// around for the life of the process. Looked up by name (not array index)
 /// so the mapping survives `Action` or `BUTTONS` being reordered.
+/// RGBA bytes of a sidebar icon, for the egui toolbar.
+pub fn icon_rgba(action: Action) -> (usize, usize, &'static [u8]) {
+    let ic = icon_for(action);
+    (ic.w, ic.h, ic.rgba.as_slice())
+}
+
 fn icon_for(action: Action) -> &'static IconImage {
     static ICONS: OnceLock<IconSet> = OnceLock::new();
     let icons = ICONS.get_or_init(|| IconSet {

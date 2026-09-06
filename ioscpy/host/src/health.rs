@@ -4,7 +4,7 @@
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -40,6 +40,12 @@ pub fn print_capabilities(ack: &HelloAck) {
         on_off(c.keyboard),
         on_off(c.orientation),
     );
+    if !c.diagnostics.is_empty() {
+        println!("  --- diagnostics ---");
+        for line in &c.diagnostics {
+            println!("  {line}");
+        }
+    }
 }
 
 /// How a session ended.
@@ -68,6 +74,30 @@ pub fn run_session(
     clip_in: Option<&Sender<String>>,
     codec: u8,
     suppress_keyboard: bool,
+) -> Result<SessionEnd> {
+    run_session_ex(
+        stream,
+        stop,
+        frame_sink,
+        input_rx,
+        clip_in,
+        codec,
+        suppress_keyboard,
+        None,
+        None,
+    )
+}
+
+pub fn run_session_ex(
+    stream: TcpStream,
+    stop: Arc<AtomicBool>,
+    frame_sink: Option<FrameSlot>,
+    input_rx: Option<&Receiver<InputFrame>>,
+    clip_in: Option<&Sender<String>>,
+    codec: u8,
+    suppress_keyboard: bool,
+    ui_out: Option<&Sender<(MessageType, Vec<u8>)>>,
+    diag_out: Option<&Arc<Mutex<Vec<String>>>>,
 ) -> Result<SessionEnd> {
     stream.set_read_timeout(None).ok();
     let mut writer = stream.try_clone().context("clone control stream")?;
@@ -109,6 +139,7 @@ pub fn run_session(
     let sink = frame_sink.clone();
     let reader_count = video_count.clone();
     let reader_keyframe = want_keyframe.clone();
+    let reader_diag = diag_out.cloned();
     let reader_handle = thread::spawn(move || {
         // H.264 is stateful, so we decode here, in order, as frames arrive (can't
         // keep latest and decode later). The decoder is built on the first H.264
@@ -173,8 +204,10 @@ pub fn run_session(
         .unwrap_or_else(Instant::now); // so we ping right away
     let mut last_pong = Instant::now();
     let video_stall = Duration::from_secs(4);
+    let first_frame_stall = Duration::from_secs(20);
     let mut last_video_count = 0u64;
     let mut last_video_progress = Instant::now();
+    let mut last_start_stream = Instant::now();
     let mut last_keyframe_req = Instant::now()
         .checked_sub(Duration::from_secs(1))
         .unwrap_or_else(Instant::now);
@@ -191,9 +224,28 @@ pub fn run_session(
             if count != last_video_count {
                 last_video_count = count;
                 last_video_progress = Instant::now();
-            } else if last_video_progress.elapsed() > video_stall {
-                crate::warn!("video stalled, reconnecting");
-                break SessionEnd::Lost;
+            } else {
+                // Tweak often attaches after Hello. Re-send StartStream until
+                // the first frame; don't drop the session in those first seconds.
+                let stall = if count == 0 {
+                    first_frame_stall
+                } else {
+                    video_stall
+                };
+                if count == 0 && last_start_stream.elapsed() >= Duration::from_secs(2) {
+                    let _ = protocol::write_frame(
+                        &mut writer,
+                        MessageType::StartStream,
+                        CHANNEL_CONTROL,
+                        seq,
+                        &[codec],
+                    );
+                    seq += 1;
+                    last_start_stream = Instant::now();
+                } else if last_video_progress.elapsed() > stall {
+                    crate::warn!("video stalled, reconnecting");
+                    break SessionEnd::Lost;
+                }
             }
         }
 
@@ -253,14 +305,31 @@ pub fn run_session(
         match rx.recv_timeout(Duration::from_millis(16)) {
             Ok(Incoming::Frame(frame)) => match frame.message_type() {
                 Some(MessageType::Pong) => last_pong = Instant::now(),
-                Some(MessageType::Log) => print_log(&frame.payload),
-                Some(MessageType::Error) => print_error(&frame.payload),
+                Some(MessageType::Log) => {
+                    if let Some(diag) = &reader_diag {
+                        if let Ok(log) = serde_json::from_slice::<LogMessage>(&frame.payload) {
+                            if let Ok(mut g) = diag.lock() {
+                                g.push(log.message);
+                            }
+                        }
+                    }
+                    print_log(&frame.payload);
+                }
+                Some(MessageType::Error) => {
+                    print_error(&frame.payload);
+                    if let Some(tx) = ui_out {
+                        let _ = tx.send((MessageType::Error, frame.payload.clone()));
+                    }
+                }
                 Some(MessageType::ClipboardChanged) => {
-                    // [flags:u8][utf8]; hand the text to the window thread, which
-                    // owns the pasteboard and sync bookkeeping (and the main thread).
                     if let (Some(tx), true) = (clip_in, frame.payload.len() >= 1) {
                         let text = String::from_utf8_lossy(&frame.payload[1..]).into_owned();
                         let _ = tx.send(text);
+                    }
+                }
+                Some(MessageType::UiDumpResult) => {
+                    if let Some(tx) = ui_out {
+                        let _ = tx.send((MessageType::UiDumpResult, frame.payload));
                     }
                 }
                 _ => {}

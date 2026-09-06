@@ -4,7 +4,12 @@
 //! handshakes with the daemon, and opens the session. Flags only pick a device
 //! or turn on diagnostics.
 
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
+mod app;
+mod auto;
 mod cli;
+mod ocr;
 mod clipboard;
 mod config;
 mod device;
@@ -57,7 +62,19 @@ fn run(cli: &Cli) -> Result<()> {
     if cli.list {
         return cmd_list();
     }
+    if wants_gui(cli) {
+        return app::run(cli.clone());
+    }
     cmd_connect(cli)
+}
+
+fn wants_gui(cli: &Cli) -> bool {
+    !cli.debug
+        && !cli.handshake_only
+        && cli.snapshot.is_none()
+        && cli.bench.is_none()
+        && cli.action.is_none()
+        && cli.soak.is_none()
 }
 
 /// Print attached devices, one per line.
@@ -171,7 +188,7 @@ fn cmd_connect(cli: &Cli) -> Result<()> {
 /// Connect, handshake, run the session, and reconnect on drops until `stop` is set.
 /// With a frame sink the session streams video; without one it just holds the
 /// control channel. The `--handshake-only` path returns right after the handshake.
-fn run_connection_loop(
+pub(crate) fn run_connection_loop(
     cli: &Cli,
     port: u16,
     stop: &Arc<AtomicBool>,

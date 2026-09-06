@@ -219,12 +219,13 @@ fn install_key_monitor(tx: Sender<InputFrame>, clip: Arc<Mutex<ClipState>>) {
                 return nil;
             }
 
-            // Everything else is text: ASCII via HID, the rest via paste.
+            // Everything else is text, including Cyrillic вЂ” the tweak inserts
+            // non-ASCII into the first responder instead of pasting.
             let chars: *mut Object = msg_send![event, characters];
             if !chars.is_null() {
                 let s = nsstring_to_string(chars);
                 if !s.is_empty() && !s.chars().all(char::is_control) {
-                    send_typed_text(&tx, &clip, &s);
+                    send_typed_text(&tx, &s);
                     return nil;
                 }
             }
@@ -243,77 +244,18 @@ fn install_key_monitor(tx: Sender<InputFrame>, clip: Arc<Mutex<ClipState>>) {
 #[cfg(not(target_os = "macos"))]
 fn install_key_monitor(_tx: Sender<InputFrame>, _clip: Arc<Mutex<ClipState>>) {}
 
-/// Characters the device can inject as HID key events (US layout). Everything
-/// else, including Cyrillic, has to ride CLIPBOARD_SET + paste.
-fn hid_typeable_char(c: char) -> bool {
-    c.is_ascii() && !c.is_control()
-}
-
-fn send_typed_text(tx: &Sender<InputFrame>, clip: &Arc<Mutex<ClipState>>, text: &str) {
+fn send_typed_text(tx: &Sender<InputFrame>, text: &str) {
     if text.is_empty() {
         return;
     }
-    if text.chars().all(hid_typeable_char) {
-        let _ = tx.send(InputFrame::new(
-            MessageType::InputText,
-            protocol::encode_text(text),
-        ));
+    let payload = crate::keyboard::to_hid_typeable_string(text);
+    if payload.is_empty() {
         return;
     }
-    if let Ok(mut st) = clip.lock() {
-        st.last_synced_hash = Some(clipboard::hash_text(text));
-    }
-    send_clipboard_set(tx, text, true);
-}
-
-/// Coalesces non-ASCII keystrokes so a burst of Cyrillic becomes one paste
-/// instead of one Cmd+V per letter.
-#[cfg(not(target_os = "macos"))]
-struct PendingUnicode {
-    buf: String,
-    last: Option<Instant>,
-}
-
-#[cfg(not(target_os = "macos"))]
-impl Default for PendingUnicode {
-    fn default() -> Self {
-        Self {
-            buf: String::new(),
-            last: None,
-        }
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn flush_pending_unicode(
-    tx: &Sender<InputFrame>,
-    clip: &Arc<Mutex<ClipState>>,
-    pending: &Arc<Mutex<PendingUnicode>>,
-) {
-    let text = match pending.lock() {
-        Ok(mut p) if !p.buf.is_empty() => {
-            p.last = None;
-            std::mem::take(&mut p.buf)
-        }
-        _ => return,
-    };
-    send_typed_text(tx, clip, &text);
-}
-
-#[cfg(not(target_os = "macos"))]
-fn flush_pending_unicode_idle(
-    tx: &Sender<InputFrame>,
-    clip: &Arc<Mutex<ClipState>>,
-    pending: &Arc<Mutex<PendingUnicode>>,
-) {
-    let ready = pending.lock().ok().is_some_and(|p| {
-        !p.buf.is_empty()
-            && p.last
-                .is_some_and(|t| t.elapsed() >= Duration::from_millis(90))
-    });
-    if ready {
-        flush_pending_unicode(tx, clip, pending);
-    }
+    let _ = tx.send(InputFrame::new(
+        MessageType::InputText,
+        protocol::encode_text(&payload),
+    ));
 }
 
 /// Forwards typed characters from minifb's input callback to the device as text.
@@ -323,13 +265,13 @@ fn flush_pending_unicode_idle(
 /// Ctrl+letter (caught by `is_control`), but Wayland resolves the bare keysym and
 /// hands us the plain letter, which `is_control` wouldn't catch.
 ///
-/// ASCII goes as INPUT_TEXT (HID on the phone). Anything else, including Russian,
-/// is buffered and pasted: the tweak only maps US-ASCII onto HID and drops the rest.
+/// On Windows, English layouts go through this callback as the real characters
+/// (then paste, so iOS's Russian hardware keyboard cannot remap them). Russian
+/// layouts are typed from scan codes in `pump_keys` instead.
 #[cfg(not(target_os = "macos"))]
 struct TextForwarder {
+    #[cfg_attr(windows, allow(dead_code))]
     tx: Sender<InputFrame>,
-    clip: Arc<Mutex<ClipState>>,
-    pending: Arc<Mutex<PendingUnicode>>,
     ctrl: bool,
 }
 
@@ -345,15 +287,21 @@ impl minifb::InputCallback for TextForwarder {
         if c.is_control() {
             return;
         }
-        if hid_typeable_char(c) {
-            flush_pending_unicode(&self.tx, &self.clip, &self.pending);
-            send_typed_text(&self.tx, &self.clip, &c.to_string());
+        #[cfg(windows)]
+        {
+            if crate::keyboard::layout_is_cyrillic() {
+                return;
+            }
+            // Only buffer here. `pump_keys` pastes after a short idle so we never
+            // overlap two Cmd+V operations (that drops letters) and so a burst of
+            // keys becomes one paste (iOS would otherwise put spaces between them).
+            let mut buf = latin_buf().lock().unwrap();
+            buf.text.push(c);
+            buf.last_input = Instant::now();
             return;
         }
-        if let Ok(mut p) = self.pending.lock() {
-            p.buf.push(c);
-            p.last = Some(Instant::now());
-        }
+        #[cfg(not(windows))]
+        send_typed_text(&self.tx, &c.to_string());
     }
 
     fn set_key_state(&mut self, key: minifb::Key, state: bool) {
@@ -365,18 +313,11 @@ impl minifb::InputCallback for TextForwarder {
 
 /// Register text-input forwarding on the window. minifb's callback is per-window,
 /// so this must run again after the window is recreated on rotation. macOS uses
-/// the global `install_key_monitor` instead, so there it's a no-op.
+/// the global `install_key_monitor` instead.
 #[cfg(not(target_os = "macos"))]
-fn attach_text_input(
-    window: &mut Window,
-    tx: &Sender<InputFrame>,
-    clip: &Arc<Mutex<ClipState>>,
-    pending: &Arc<Mutex<PendingUnicode>>,
-) {
+fn attach_text_input(window: &mut Window, tx: &Sender<InputFrame>) {
     window.set_input_callback(Box::new(TextForwarder {
         tx: tx.clone(),
-        clip: clip.clone(),
-        pending: pending.clone(),
         ctrl: false,
     }));
 }
@@ -384,26 +325,91 @@ fn attach_text_input(
 #[cfg(target_os = "macos")]
 fn attach_text_input(_window: &mut Window, _tx: &Sender<InputFrame>) {}
 
+/// Wait this long after the last English key before pasting the burst.
+#[cfg(windows)]
+const LATIN_IDLE: Duration = Duration::from_millis(70);
+
+/// iOS Cmd+V is asynchronous; a second paste before this has elapsed overwrites
+/// the clipboard and the first letters never appear.
+#[cfg(windows)]
+const LATIN_PASTE_GAP: Duration = Duration::from_millis(90);
+
+#[cfg(windows)]
+struct LatinBuf {
+    text: String,
+    last_input: Instant,
+    last_paste: Option<Instant>,
+}
+
+#[cfg(windows)]
+fn latin_buf() -> &'static Mutex<LatinBuf> {
+    use std::sync::OnceLock;
+    static BUF: OnceLock<Mutex<LatinBuf>> = OnceLock::new();
+    BUF.get_or_init(|| {
+        Mutex::new(LatinBuf {
+            text: String::new(),
+            last_input: Instant::now(),
+            last_paste: None,
+        })
+    })
+}
+
+#[cfg(windows)]
+fn paste_latin(tx: &Sender<InputFrame>, text: &str) {
+    // WORD JOINER: iOS smart-insert treats each Cmd+V as a "word" and inserts
+    // spaces between them. Wrapping keeps adjacent pastes glued together.
+    let mut wrapped = String::with_capacity(text.len() + 6);
+    wrapped.push('\u{2060}');
+    wrapped.push_str(text);
+    wrapped.push('\u{2060}');
+    send_clipboard_set(tx, &wrapped, true);
+}
+
+#[cfg(windows)]
+fn flush_latin(tx: &Sender<InputFrame>, force: bool) {
+    let mut buf = latin_buf().lock().unwrap();
+    if buf.text.is_empty() {
+        return;
+    }
+    if !force {
+        if buf.last_input.elapsed() < LATIN_IDLE {
+            return;
+        }
+        if buf.last_paste.is_some_and(|t| t.elapsed() < LATIN_PASTE_GAP) {
+            return;
+        }
+    }
+    paste_latin(tx, &buf.text);
+    buf.last_paste = Some(Instant::now());
+    buf.text.clear();
+}
+
 /// Poll this frame's keys and forward shortcuts and editing keys, mirroring the
-/// macOS monitor but with Ctrl as the modifier (macOS uses Cmd). Text itself goes
-/// through `TextForwarder`; here we handle Esc (back), Enter/Tab, the repeating
-/// Backspace/arrows, and the Ctrl combos. macOS routes all of this through
+/// macOS monitor but with Ctrl as the modifier (macOS uses Cmd). On Linux, text
+/// itself goes through `TextForwarder`. On Windows, a Russian layout is typed
+/// from scan codes (iOS's Russian hardware keyboard) and an English layout is
+/// pasted as the real Latin characters. macOS routes all of this through
 /// `install_key_monitor`, so this is Linux/Windows only.
 #[cfg(not(target_os = "macos"))]
-fn pump_keys(
-    window: &Window,
-    tx: &Sender<InputFrame>,
-    clip: &Arc<Mutex<ClipState>>,
-    pending: &Arc<Mutex<PendingUnicode>>,
-) {
+fn pump_keys(window: &Window, tx: &Sender<InputFrame>, clip: &Arc<Mutex<ClipState>>) {
     use minifb::{Key, KeyRepeat};
 
     let ctrl = window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl);
 
+    #[cfg(windows)]
+    let cyrillic_layout = crate::keyboard::layout_is_cyrillic();
+    #[cfg(windows)]
+    {
+        if cyrillic_layout {
+            flush_latin(tx, true);
+        } else {
+            flush_latin(tx, false);
+        }
+    }
+
     // One-shot keys: shortcuts and the editing keys that shouldn't auto-repeat.
     for key in window.get_keys_pressed(KeyRepeat::No) {
         if ctrl {
-            flush_pending_unicode(tx, clip, pending);
             match key {
                 Key::J => send_action(tx, SystemAction::Home),
                 Key::L => send_action(tx, SystemAction::Lock),
@@ -418,16 +424,15 @@ fn pump_keys(
             }
         } else {
             match key {
-                Key::Escape => {
-                    flush_pending_unicode(tx, clip, pending);
-                    send_action(tx, SystemAction::Back);
-                }
+                Key::Escape => send_action(tx, SystemAction::Back),
                 Key::Enter | Key::NumPadEnter => {
-                    flush_pending_unicode(tx, clip, pending);
+                    #[cfg(windows)]
+                    flush_latin(tx, true);
                     send_key(tx, KeyCode::Enter);
                 }
                 Key::Tab => {
-                    flush_pending_unicode(tx, clip, pending);
+                    #[cfg(windows)]
+                    flush_latin(tx, true);
                     send_key(tx, KeyCode::Tab);
                 }
                 _ => {}
@@ -439,45 +444,45 @@ fn pump_keys(
     // it shows up in both KeyRepeat::No and ::Yes, so these keys must stay out of the
     // one-shot match above, or they'd fire twice that frame. Keep the two sets disjoint.
     if !ctrl {
+        #[cfg(windows)]
+        let type_from_keys = cyrillic_layout && !crate::keyboard::alt_down();
+        #[cfg(not(windows))]
+        let type_from_keys = false;
+        let shift = window.is_key_down(Key::LeftShift) || window.is_key_down(Key::RightShift);
+        #[cfg(windows)]
+        let caps = crate::keyboard::caps_on();
+        #[cfg(not(windows))]
+        let caps = false;
+
         for key in window.get_keys_pressed(KeyRepeat::Yes) {
             match key {
                 Key::Backspace => {
-                    // Eat unsent Cyrillic first so Backspace doesn't delete a
-                    // character that isn't on the phone yet.
-                    let popped = pending.lock().ok().is_some_and(|mut p| {
-                        if p.buf.pop().is_some() {
-                            p.last = Some(Instant::now());
-                            true
-                        } else {
-                            false
+                    #[cfg(windows)]
+                    {
+                        if !cyrillic_layout {
+                            let mut buf = latin_buf().lock().unwrap();
+                            if !buf.text.is_empty() {
+                                buf.text.pop();
+                                buf.last_input = Instant::now();
+                                continue;
+                            }
                         }
-                    });
-                    if !popped {
-                        send_key(tx, KeyCode::Backspace);
                     }
+                    send_key(tx, KeyCode::Backspace);
                 }
-                Key::Left => {
-                    flush_pending_unicode(tx, clip, pending);
-                    send_key(tx, KeyCode::Left);
-                }
-                Key::Right => {
-                    flush_pending_unicode(tx, clip, pending);
-                    send_key(tx, KeyCode::Right);
-                }
-                Key::Up => {
-                    flush_pending_unicode(tx, clip, pending);
-                    send_key(tx, KeyCode::Up);
-                }
-                Key::Down => {
-                    flush_pending_unicode(tx, clip, pending);
-                    send_key(tx, KeyCode::Down);
+                Key::Left => send_key(tx, KeyCode::Left),
+                Key::Right => send_key(tx, KeyCode::Right),
+                Key::Up => send_key(tx, KeyCode::Up),
+                Key::Down => send_key(tx, KeyCode::Down),
+                _ if type_from_keys => {
+                    if let Some(c) = crate::keyboard::hid_char_from_key(key, shift, caps) {
+                        send_typed_text(tx, &c.to_string());
+                    }
                 }
                 _ => {}
             }
         }
     }
-
-    flush_pending_unicode_idle(tx, clip, pending);
 }
 
 /// Window size for a `w`x`h` device frame at the given scale, clamped to at most
@@ -695,12 +700,7 @@ pub fn run_window(
     let (win_w, win_h) = scaled_fit(first.width, first.height, display_scale, sidebar::WIDTH);
     let mut window = open_window(title, win_w, win_h)?;
     let clip = Arc::new(Mutex::new(ClipState::default()));
-    #[cfg(not(target_os = "macos"))]
-    let pending = Arc::new(Mutex::new(PendingUnicode::default()));
     install_key_monitor(input_tx.clone(), clip.clone());
-    #[cfg(not(target_os = "macos"))]
-    attach_text_input(&mut window, &input_tx, &clip, &pending);
-    #[cfg(target_os = "macos")]
     attach_text_input(&mut window, &input_tx);
 
     let mut current = first;
@@ -723,9 +723,6 @@ pub fn run_window(
             let pos = window.get_position();
             if let Ok(mut w) = open_window(title, nw, nh) {
                 w.set_position(pos.0, pos.1);
-                #[cfg(not(target_os = "macos"))]
-                attach_text_input(&mut w, &input_tx, &clip, &pending);
-                #[cfg(target_os = "macos")]
                 attach_text_input(&mut w, &input_tx);
                 window = w;
             }
@@ -739,7 +736,7 @@ pub fn run_window(
         let input_ctx = InputCtx { content_w, win_h: gh, tx: &input_tx, clip: &clip };
         pump_input(&window, &current, &mut input, &input_ctx);
         #[cfg(not(target_os = "macos"))]
-        pump_keys(&window, &input_tx, &clip, &pending);
+        pump_keys(&window, &input_tx, &clip);
 
         // Render a window-sized, letterboxed buffer at the backing (retina)
         // resolution for minifb to blit 1:1. Both axes are capped together so a
@@ -768,8 +765,6 @@ pub fn run_window(
         // Push Mac clipboard changes to the device (rate-limited).
         if last_clip_poll.elapsed() >= Duration::from_millis(300) {
             last_clip_poll = Instant::now();
-            #[cfg(not(target_os = "macos"))]
-            flush_pending_unicode(&input_tx, &clip, &pending);
             poll_clipboard(&input_tx, &clip);
         }
         // Apply iPhone to Mac clipboard changes here on the main thread.

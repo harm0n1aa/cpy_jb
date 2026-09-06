@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import bz2
 import gzip
 import hashlib
 import re
 import shutil
 import subprocess
+import time
+from email.utils import formatdate
 from pathlib import Path
 
 
@@ -17,24 +20,61 @@ def sha(data: bytes, name: str) -> str:
     return h.hexdigest()
 
 
-def control_from_deb(deb: Path) -> str:
-    out = subprocess.check_output(["dpkg-deb", "-f", str(deb)], text=True)
-    drop = {"Filename", "Size", "MD5sum", "SHA1", "SHA256", "Status"}
-    lines = []
-    for line in out.splitlines():
-        key = line.split(":", 1)[0].strip()
-        if key in drop:
-            continue
-        lines.append(line.rstrip())
-    while lines and not lines[-1].strip():
-        lines.pop()
-    return "\n".join(lines) + "\n"
+def control_fields(deb: Path) -> dict[str, str]:
+    """Read control fields; prefer dpkg-deb, fall back to ar/tar parse."""
+    try:
+        out = subprocess.check_output(["dpkg-deb", "-f", str(deb)], text=True)
+        fields: dict[str, str] = {}
+        key = None
+        for line in out.splitlines():
+            if not line:
+                continue
+            if line[0].isspace() and key:
+                fields[key] += "\n" + line
+                continue
+            if ":" in line:
+                key, val = line.split(":", 1)
+                fields[key.strip()] = val.strip()
+        return fields
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        pass
+
+    # Minimal fallback from filename: name_ver_arch.deb
+    m = re.match(r"^(?P<pkg>.+)_(?P<ver>[^_]+)_(?P<arch>.+)\.deb$", deb.name)
+    if not m:
+        raise SystemExit(f"cannot parse control for {deb}")
+    return {
+        "Package": m.group("pkg"),
+        "Version": m.group("ver"),
+        "Architecture": "iphoneos-arm64",
+        "Maintainer": "ioscpy <ioscpy@local>",
+        "Description": "Mirror and control this device over USB.",
+        "Section": "Tweaks",
+        "Depends": "ellekit | mobilesubstrate, firmware (>= 14.0)",
+        "Name": "ioscpy",
+    }
 
 
-def packages_entry(deb_name: str, data: bytes, ctrl: str) -> str:
+def packages_entry(deb_name: str, data: bytes, fields: dict[str, str]) -> str:
+    # Stable field order; ASCII-only values so apt/Sileo never choke on quotes.
+    pkg = fields.get("Package", "com.ioscpy.device")
+    name = fields.get("Name", "ioscpy")
+    ver = fields.get("Version", "0")
+    desc = fields.get("Description", "ioscpy").split("\n", 1)[0].strip()
+    depends = fields.get("Depends", "ellekit | mobilesubstrate, firmware (>= 14.0)")
+    section = fields.get("Section", "Tweaks")
+    # Force Dopamine/Sileo arch even if Theos stamped arm64e.
     return (
-        f"{ctrl}"
-        f"Filename: {deb_name}\n"
+        f"Package: {pkg}\n"
+        f"Name: {name}\n"
+        f"Version: {ver}\n"
+        f"Architecture: iphoneos-arm64\n"
+        f"Maintainer: ioscpy <ioscpy@local>\n"
+        f"Author: ioscpy <ioscpy@local>\n"
+        f"Section: {section}\n"
+        f"Depends: {depends}\n"
+        f"Description: {desc}\n"
+        f"Filename: ./{deb_name}\n"
         f"Size: {len(data)}\n"
         f"MD5sum: {sha(data, 'md5')}\n"
         f"SHA1: {sha(data, 'sha1')}\n"
@@ -44,10 +84,7 @@ def packages_entry(deb_name: str, data: bytes, ctrl: str) -> str:
 
 
 def release_body(file_map: dict[str, bytes]) -> str:
-    """file_map: path relative to the Release file's directory -> content."""
-    md5_lines = []
-    sha1_lines = []
-    sha256_lines = []
+    md5_lines, sha1_lines, sha256_lines = [], [], []
     for rel, data in sorted(file_map.items()):
         md5_lines.append(f" {sha(data, 'md5')} {len(data)} {rel}")
         sha1_lines.append(f" {sha(data, 'sha1')} {len(data)} {rel}")
@@ -57,10 +94,11 @@ def release_body(file_map: dict[str, bytes]) -> str:
         "Label: ioscpy\n"
         "Suite: stable\n"
         "Version: 1.0\n"
-        "Codename: stable\n"
+        "Codename: ios\n"
+        "Date: " + formatdate(time.time(), localtime=False) + "\n"
         "Architectures: iphoneos-arm64\n"
         "Components: main\n"
-        "Description: ioscpy Mac-built packages (arm64 + arm64e)\n"
+        "Description: ioscpy apt source\n"
         "MD5Sum:\n"
         + "\n".join(md5_lines)
         + "\nSHA1:\n"
@@ -88,44 +126,43 @@ def main() -> None:
     repo.mkdir(parents=True)
 
     entries: list[str] = []
-    deb_files: list[tuple[str, bytes]] = []
     for deb in args.debs:
         if not deb.is_file():
             raise SystemExit(f"missing deb: {deb}")
         data = deb.read_bytes()
-        ctrl = control_from_deb(deb)
+        fields = control_fields(deb)
         write_bytes(repo / deb.name, data)
-        if re.search(r"com\.ioscpy\.device_", deb.name):
+        if "com.ioscpy.device_" in deb.name:
             write_bytes(repo / "ioscpy.deb", data)
-        # Also under dists path (some clients resolve relative to binary-*).
-        write_bytes(
-            repo / "dists/stable/main/binary-iphoneos-arm64" / deb.name,
-            data,
-        )
-        deb_files.append((deb.name, data))
-        entries.append(packages_entry(deb.name, data, ctrl))
+        write_bytes(repo / "dists/stable/main/binary-iphoneos-arm64" / deb.name, data)
+        entries.append(packages_entry(deb.name, data, fields))
 
     packages = "".join(entries).encode("utf-8")
     packages_gz = gzip.compress(packages, mtime=0)
+    packages_bz2 = bz2.compress(packages)
 
-    # Flat root (Cydia-style) — same as our LAN serve-deb.py.
-    write_bytes(repo / "Packages", packages)
-    write_bytes(repo / "Packages.gz", packages_gz)
+    for root in (repo, repo / "dists/stable/main/binary-iphoneos-arm64"):
+        write_bytes(root / "Packages", packages)
+        write_bytes(root / "Packages.gz", packages_gz)
+        write_bytes(root / "Packages.bz2", packages_bz2)
+
     write_bytes(
         repo / "Release",
-        release_body({"Packages": packages, "Packages.gz": packages_gz}).encode(),
+        release_body(
+            {
+                "Packages": packages,
+                "Packages.gz": packages_gz,
+                "Packages.bz2": packages_bz2,
+            }
+        ).encode(),
     )
-
-    # Standard apt dists tree — what modern Sileo/APT actually fetches.
-    bin_dir = "main/binary-iphoneos-arm64"
-    write_bytes(repo / "dists/stable" / bin_dir / "Packages", packages)
-    write_bytes(repo / "dists/stable" / bin_dir / "Packages.gz", packages_gz)
     write_bytes(
         repo / "dists/stable/Release",
         release_body(
             {
-                f"{bin_dir}/Packages": packages,
-                f"{bin_dir}/Packages.gz": packages_gz,
+                "main/binary-iphoneos-arm64/Packages": packages,
+                "main/binary-iphoneos-arm64/Packages.gz": packages_gz,
+                "main/binary-iphoneos-arm64/Packages.bz2": packages_bz2,
             }
         ).encode(),
     )
@@ -134,15 +171,12 @@ def main() -> None:
         repo / "index.html",
         (
             "<!doctype html><meta charset=utf-8><title>ioscpy</title>"
-            "<h1>ioscpy apt source</h1>"
-            "<p>Add this URL in Sileo → Sources:</p>"
-            "<pre>https://harm0n1aa.github.io/cpy_jb/</pre>"
-            "<p>Then refresh sources, search <b>ioscpy</b>, install 0.1.27+.</p>\n"
+            "<h1>ioscpy</h1>"
+            "<p>Sileo source:</p>"
+            "<pre>https://harm0n1aa.github.io/</pre>\n"
         ).encode(),
     )
-    print(f"wrote apt repo -> {repo} ({len(args.debs)} deb(s))")
-    for name, _ in deb_files:
-        print(f"  {name}")
+    print(f"wrote apt repo -> {repo}")
 
 
 if __name__ == "__main__":

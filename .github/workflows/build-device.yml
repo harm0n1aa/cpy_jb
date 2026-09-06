@@ -136,7 +136,8 @@ jobs:
             Mac-built package with **arm64 + arm64e** (for iPhone 12 / A14).
 
             ## Sileo
-            Add source: `https://harm0n1aa.github.io/cpy_jb/`
+            Add source: `https://harm0n1aa.github.io/`
+            (also mirrors at `https://harm0n1aa.github.io/cpy_jb/`)
             Then search **ioscpy** → Install → Restart SpringBoard.
           files: |
             ioscpy/device/packages/*.deb

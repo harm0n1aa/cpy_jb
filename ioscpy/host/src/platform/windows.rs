@@ -3,7 +3,6 @@
 //! (127.0.0.1:27015) from Apple Mobile Device Support. No USB driver is touched.
 
 use std::path::PathBuf;
-use std::process::Command;
 
 /// Resolve a CLI to a full path: search PATH, then the directory of the running
 /// `ioscpy.exe` (so a user can drop `iproxy.exe` next to it). `.exe` is appended.
@@ -15,7 +14,21 @@ pub fn tool_path(name: &str) -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             dirs.push(dir.to_path_buf());
+            dirs.push(dir.join("bin"));
+            dirs.push(dir.join("tools").join("libimobiledevice"));
+            let mut walk = dir.to_path_buf();
+            for _ in 0..4 {
+                if !walk.pop() {
+                    break;
+                }
+                dirs.push(walk.join("bin"));
+                dirs.push(walk.join("tools").join("libimobiledevice"));
+            }
         }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        dirs.push(cwd.join("bin"));
+        dirs.push(cwd.join("tools").join("libimobiledevice"));
     }
     super::resolve_in_dirs(name, ".exe", dirs)
 }
@@ -30,7 +43,7 @@ pub fn cache_dir() -> Option<PathBuf> {
 
 pub fn os_version() -> String {
     // `cmd /C ver` prints something like "Microsoft Windows [Version 10.0.22631.0]".
-    Command::new("cmd")
+    super::hidden_command("cmd")
         .args(["/C", "ver"])
         .output()
         .ok()

@@ -1,7 +1,29 @@
 //! Platform seam: every Windows-vs-Unix difference lives behind these four
 //! functions, so the rest of the host stays platform-neutral.
 
+use std::ffi::OsStr;
 use std::path::PathBuf;
+use std::process::Command;
+
+/// Build a `Command` that never flashes a console window on Windows.
+/// `idevice_id` / `iproxy` are console apps; spawning them from a GUI
+/// otherwise pops a cmd window on every device scan.
+pub fn hidden_command(program: impl AsRef<OsStr>) -> Command {
+    let mut cmd = Command::new(program);
+    hide_console(&mut cmd);
+    cmd
+}
+
+/// Apply CREATE_NO_WINDOW to an existing command (Windows no-op elsewhere).
+pub fn hide_console(cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let _ = cmd;
+}
 
 #[cfg(target_os = "windows")]
 #[path = "windows.rs"]
