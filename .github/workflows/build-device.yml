@@ -53,6 +53,15 @@ jobs:
           git clone --depth=1 https://github.com/theos/sdks.git \
             "${{ github.workspace }}/.theos-roothide/sdks"
 
+      - name: Ensure iPhoneOS15 SDK present
+        run: |
+          THEOS="${{ github.workspace }}/.theos-roothide"
+          ls "$THEOS/sdks" || true
+          if ! ls "$THEOS/sdks"/iPhoneOS15*.sdk >/dev/null 2>&1; then
+            echo "No iPhoneOS15 SDK in theos/sdks; falling back to whatever is available"
+            ls "$THEOS/sdks"
+          fi
+
       - name: Read package version
         id: ver
         run: |
