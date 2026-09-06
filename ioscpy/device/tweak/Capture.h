@@ -28,8 +28,10 @@ NSData *IOSPYCaptureScreenJPEG(CGFloat maxDimension, CGFloat quality,
                                int *outWidth, int *outHeight,
                                double *outRenderMs, double *outEncodeMs);
 
-#ifdef IOSPY_IN_DAEMON
+// Last capture backend note (e.g. "tweak-uikit", "tweak-fail") for diagnostics.
 NSString *IOSPYCaptureLastNote(void);
+
+#ifdef IOSPY_IN_DAEMON
 BOOL IOSPYCaptureHasRenderFn(void);
 void IOSPYCaptureProbeFramebuffer(int *outWidth, int *outHeight);
 #endif
