@@ -21,6 +21,9 @@ void IOSPYInjectTouch(IOSPYTouchPhase phase, uint8_t fingerID, float x, float y)
 // 4=AppSwitcher, 5=RotateLeft, 6=RotateRight, 7=Screenshot, 8=Back).
 void IOSPYSystemAction(uint16_t action);
 
+// Open an installed app by bundle id (SpringBoard / LSApplicationWorkspace).
+void IOSPYLaunchApp(NSString *bundleId);
+
 // Type a run of text into the focused field of the foreground app. The Mac has
 // already resolved its layout, so these are the literal characters to enter.
 void IOSPYTypeText(NSString *text);

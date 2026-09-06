@@ -18,7 +18,7 @@
 #import <unistd.h>
 #import <errno.h>
 
-NSString *const IOSPYDaemonVersion = @"0.1.33";
+NSString *const IOSPYDaemonVersion = @"0.1.34";
 
 @implementation IOSPYControlServer {
     uint16_t _port;

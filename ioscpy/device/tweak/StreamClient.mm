@@ -239,7 +239,16 @@ static uint64_t clipHash(NSString *t) {
             uint16_t action;
             memcpy(&action, b, 2);
             action = ntohs(action);
-            dispatch_async(dispatch_get_main_queue(), ^{ IOSPYSystemAction(action); });
+            if (action == 9 && payload.length > 2) {
+                NSString *bid = [[NSString alloc] initWithBytes:b + 2
+                                                         length:payload.length - 2
+                                                       encoding:NSUTF8StringEncoding];
+                if (bid.length) {
+                    IOSPYLaunchApp(bid);
+                }
+            } else {
+                dispatch_async(dispatch_get_main_queue(), ^{ IOSPYSystemAction(action); });
+            }
         } else if (header.type == IOSPYMsgInputText && payload.length > 0) {
             NSString *text = [[NSString alloc] initWithData:payload encoding:NSUTF8StringEncoding];
             if (text) {

@@ -72,6 +72,7 @@ pub struct AutoApp {
     app_pin: String,
     profile: String,
     app_name: String,
+    app_bundle: String,
 }
 
 pub fn run(cli: Cli) -> Result<()> {
@@ -116,6 +117,7 @@ impl AutoApp {
             app_pin: auto_api::APP_PIN_DEFAULT.into(),
             profile: auto_api::PROFILE_DEFAULT.into(),
             app_name: auto_api::APP_DEFAULT.into(),
+            app_bundle: auto_api::APP_BUNDLE_DEFAULT.into(),
         };
         app.scan_now();
         app
@@ -430,6 +432,7 @@ fn draw_panel(ui: &mut Ui, app: &mut AutoApp) {
                     }
                     ui.add_space(6.0);
                     field(ui, "Приложение", &mut app.app_name, "Деньги");
+                    field(ui, "Bundle ID", &mut app.app_bundle, "com.cashline.app");
                     field(ui, "PIN экрана", &mut app.lock_pin, "956123");
                     field(ui, "PIN приложения", &mut app.app_pin, "0805");
                     ui.add_space(10.0);
@@ -449,6 +452,7 @@ fn draw_panel(ui: &mut Ui, app: &mut AutoApp) {
                                         &app.app_pin,
                                         &app.profile,
                                         &app.app_name,
+                                        &app.app_bundle,
                                     );
                                 }
                             }

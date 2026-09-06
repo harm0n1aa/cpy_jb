@@ -12,6 +12,8 @@ pub const LOCK_PIN_DEFAULT: &str = "956123";
 pub const APP_PIN_DEFAULT: &str = "0805";
 pub const PROFILE_DEFAULT: &str = "Югов";
 pub const APP_DEFAULT: &str = "Деньги";
+/// Cashline / «Деньги» — open via SpringBoard when the icon is off-screen.
+pub const APP_BUNDLE_DEFAULT: &str = "com.cashline.app";
 
 /// Fallback iOS lock passcode pad (notched iPhone). Index = digit 0..=9.
 const LOCK_PAD: [(f32, f32); 10] = [
@@ -183,23 +185,21 @@ impl Dump {
                 if f.is_empty() || looks_like_system_chrome(&node.text) {
                     return false;
                 }
+                // Include dock (y≈0.93). Cancel-collision is handled by app_opened.
                 f == n
                     || f.starts_with(&n)
-                    || (f.contains(&n) && (f.contains("cashline") || f.starts_with(&n)))
+                    || (f.contains(&n) && (f.contains("cashline") || node.bundle.contains("cashline")))
             })
             .collect();
         if found.is_empty() {
             return None;
         }
-        // Prefer icon grid (y < 0.88) over anything in the cancel/home-indicator band.
         found.sort_by(|a, b| {
-            let ae = (a.y > 0.88) as i32;
-            let be = (b.y > 0.88) as i32;
-            ae.cmp(&be)
-                .then_with(|| fold(&a.text).len().cmp(&fold(&b.text).len()))
-                .then_with(|| {
-                    a.h.partial_cmp(&b.h).unwrap_or(std::cmp::Ordering::Equal)
-                })
+            // Prefer exact / shorter labels; dock is fine.
+            fold(&a.text)
+                .len()
+                .cmp(&fold(&b.text).len())
+                .then_with(|| a.h.partial_cmp(&b.h).unwrap_or(std::cmp::Ordering::Equal))
         });
         found.into_iter().next()
     }
@@ -428,6 +428,7 @@ pub struct Job {
     app_pin: String,
     profile: String,
     app_name: String,
+    app_bundle: String,
     phase: Phase,
     status: String,
     started: Instant,
@@ -460,6 +461,7 @@ impl Job {
             app_pin: APP_PIN_DEFAULT.into(),
             profile: PROFILE_DEFAULT.into(),
             app_name: APP_DEFAULT.into(),
+            app_bundle: APP_BUNDLE_DEFAULT.into(),
             phase: Phase::Done,
             status: String::new(),
             started: Instant::now(),
@@ -483,7 +485,13 @@ impl Job {
         }
     }
 
-    pub fn start(lock_pin: &str, app_pin: &str, profile: &str, app_name: &str) -> Self {
+    pub fn start(
+        lock_pin: &str,
+        app_pin: &str,
+        profile: &str,
+        app_name: &str,
+        app_bundle: &str,
+    ) -> Self {
         let mut j = Self::idle();
         j.lock_pin = digits(lock_pin, LOCK_PIN_DEFAULT);
         j.app_pin = digits(app_pin, APP_PIN_DEFAULT);
@@ -495,13 +503,17 @@ impl Job {
         if j.app_name.is_empty() {
             j.app_name = APP_DEFAULT.into();
         }
+        j.app_bundle = app_bundle.trim().to_string();
+        if j.app_bundle.is_empty() {
+            j.app_bundle = APP_BUNDLE_DEFAULT.into();
+        }
         j.phase = Phase::Drive;
         j.started = Instant::now();
         j.until = Instant::now();
         j.status = "смотрю UI…".into();
         j.note(&format!(
-            "START app={} profile={} lock_pin={} app_pin={}",
-            j.app_name, j.profile, j.lock_pin, j.app_pin
+            "START app={} bundle={} profile={} lock_pin={} app_pin={}",
+            j.app_name, j.app_bundle, j.profile, j.lock_pin, j.app_pin
         ));
         j
     }
@@ -631,7 +643,7 @@ impl Job {
             return;
         }
 
-        // Locked / asleep: wake hard, then swipe up for passcode.
+        // Locked / asleep: one soft wake, then only swipes (hard wake → Safe Mode).
         if !self.lock_sent {
             let home_unlocked = on_sb && !has_pad && !dump.is_pin() && dump.nodes.len() >= 12;
             if home_unlocked {
@@ -639,23 +651,19 @@ impl Job {
                 self.note("DECIDE already-unlocked: SpringBoard home without pad");
             } else {
                 self.unlock_tries = self.unlock_tries.saturating_add(1);
-                if self.unlock_tries > 14 {
-                    self.fail("не разблокировал экран (нет PIN-пада)");
+                if self.unlock_tries > 10 {
+                    self.fail("не разблокировал экран — разблокируй вручную и жми авто");
                     return;
                 }
                 self.status = "разблокировка…".into();
-                if self.unlock_tries <= 3 {
-                    self.note(&format!(
-                        "DECIDE wake try={} — repeated full wake",
-                        self.unlock_tries
-                    ));
+                if self.unlock_tries == 1 {
+                    self.note("DECIDE soft-wake once (no multi-burst — Safe Mode risk)");
                     action(tx, SystemAction::Wake);
-                    action(tx, SystemAction::Wake);
-                    self.note("ACT Wake×2");
-                    self.mark_stale(now, 1100);
+                    self.note("ACT Wake");
+                    self.mark_stale(now, 1200);
                 } else {
                     self.note(&format!(
-                        "DECIDE swipe-unlock try={} reason=waiting for lock pad",
+                        "DECIDE swipe-unlock try={} (no more wake)",
                         self.unlock_tries
                     ));
                     self.swipe_unlock(tx, now);
@@ -749,19 +757,44 @@ impl Job {
                 self.need_dump(tx, now);
                 return;
             }
+            // Prefer launching by bundle — icon may be on another page / in a folder.
+            if !self.app_bundle.is_empty() {
+                self.status = format!("launch {}", self.app_bundle);
+                self.note(&format!(
+                    "DECIDE launch-bundle {} (icon «{}» not on this page)",
+                    self.app_bundle, self.app_name
+                ));
+                let _ = tx.send(InputFrame::new(
+                    MessageType::SystemAction,
+                    protocol::encode_launch_app(&self.app_bundle),
+                ));
+                self.note(&format!("ACT LaunchApp {}", self.app_bundle));
+                self.app_opened = true;
+                self.page_tries = 0;
+                self.stall = 0;
+                self.phase = Phase::Work;
+                self.mark_stale(now, 2000);
+                self.need_dump(tx, now);
+                return;
+            }
             self.page_tries = self.page_tries.saturating_add(1);
             self.note(&format!(
                 "DECIDE swipe-pages try={} want={} (not on this page)",
                 self.page_tries, self.app_name
             ));
-            if self.page_tries > 5 {
+            if self.page_tries > 4 {
                 self.fail(&format!("нет иконки «{}» на SpringBoard", self.app_name));
                 return;
             }
             self.status = "листаю домашний экран…".into();
-            swipe(tx, 0.82, 0.55, 0.18, 0.55);
-            self.note("ACT swipe page 0.82,0.55 → 0.18,0.55");
-            self.mark_stale(now, 700);
+            if self.page_tries % 2 == 1 {
+                swipe(tx, 0.82, 0.55, 0.18, 0.55);
+                self.note("ACT swipe page →");
+            } else {
+                swipe(tx, 0.18, 0.55, 0.82, 0.55);
+                self.note("ACT swipe page ←");
+            }
+            self.mark_stale(now, 900);
             self.need_dump(tx, now);
             return;
         }

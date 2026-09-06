@@ -733,58 +733,54 @@ static void actionLock(void) {
 }
 
 static void actionWake(void) {
-    // Fully wake the panel — a single backlight poke often leaves AOD / dim lock.
-    void (^burst)(void) = ^{
-        id bl = sharedOf("SBBacklightController");
-        SEL turnOn = @selector(turnOnScreenFullyWithBacklightSource:);
-        if ([bl respondsToSelector:turnOn]) {
-            void (*fn)(id, SEL, long) = (void (*)(id, SEL, long))[bl methodForSelector:turnOn];
-            fn(bl, turnOn, 0);
-            fn(bl, turnOn, 1);
-            fn(bl, turnOn, 11);
-        } else if ([bl respondsToSelector:@selector(setBacklightFactor:source:)]) {
-            void (*fn)(id, SEL, float, long) =
-                (void (*)(id, SEL, float, long))[bl methodForSelector:@selector(setBacklightFactor:source:)];
-            fn(bl, @selector(setBacklightFactor:source:), 1.0f, 1);
-        }
-        if ([bl respondsToSelector:@selector(preventIdleSleep)]) {
-            [bl performSelector:@selector(preventIdleSleep)];
-        }
-        id idle = sharedOf("SBIdleTimerGlobalCoordinator");
-        if ([idle respondsToSelector:@selector(resetIdleTimerIfNecessary)]) {
-            [idle performSelector:@selector(resetIdleTimerIfNecessary)];
-        } else if ([idle respondsToSelector:@selector(resetIdleTimer)]) {
-            [idle performSelector:@selector(resetIdleTimer)];
-        }
-        id mgr = sharedOf("SBLockScreenManager");
-        if ([mgr respondsToSelector:@selector(wakeUpDeviceIfNecessary)]) {
-            [mgr performSelector:@selector(wakeUpDeviceIfNecessary)];
-        }
-        id app = [UIApplication sharedApplication];
-        if ([app respondsToSelector:NSSelectorFromString(@"_userEventOccurred:")]) {
-            ((void (*)(id, SEL, id))objc_msgSend)(app, NSSelectorFromString(@"_userEventOccurred:"), nil);
-        }
-        if ([UIScreen.mainScreen respondsToSelector:@selector(setBrightness:)]) {
-            UIScreen.mainScreen.brightness = 1.0;
-        }
-    };
-    burst();
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), burst);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.55 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), burst);
+    // Keep this minimal — aggressive multi-burst wake was crashing SpringBoard
+    // into Safe Mode on some Dopamine/roothide devices.
+    id bl = sharedOf("SBBacklightController");
+    SEL turnOn = @selector(turnOnScreenFullyWithBacklightSource:);
+    if ([bl respondsToSelector:turnOn]) {
+        void (*fn)(id, SEL, long) = (void (*)(id, SEL, long))[bl methodForSelector:turnOn];
+        fn(bl, turnOn, 1);
+    } else if ([bl respondsToSelector:@selector(setBacklightFactor:source:)]) {
+        void (*fn)(id, SEL, float, long) =
+            (void (*)(id, SEL, float, long))[bl methodForSelector:@selector(setBacklightFactor:source:)];
+        fn(bl, @selector(setBacklightFactor:source:), 1.0f, 1);
+    }
+}
+
+static void actionLaunchApp(NSString *bundleId) {
+    if (bundleId.length == 0) {
+        return;
+    }
+    Class LS = NSClassFromString(@"LSApplicationWorkspace");
+    if (!LS) {
+        NSLog(@"[ioscpyhook] LSApplicationWorkspace missing");
+        return;
+    }
+    id ws = ((id (*)(Class, SEL))objc_msgSend)(LS, @selector(defaultWorkspace));
+    if (!ws) {
+        return;
+    }
+    SEL openSel = @selector(openApplicationWithBundleID:options:error:);
+    if ([ws respondsToSelector:openSel]) {
+        BOOL ok = ((BOOL (*)(id, SEL, id, id, NSError **))objc_msgSend)(
+            ws, openSel, bundleId, nil, NULL);
+        NSLog(@"[ioscpyhook] launch %@ -> %d", bundleId, ok);
+        return;
+    }
+    SEL openSel2 = @selector(openApplicationWithBundleIdentifier:options:error:);
+    if ([ws respondsToSelector:openSel2]) {
+        BOOL ok = ((BOOL (*)(id, SEL, id, id, NSError **))objc_msgSend)(
+            ws, openSel2, bundleId, nil, NULL);
+        NSLog(@"[ioscpyhook] launch2 %@ -> %d", bundleId, ok);
+    }
 }
 
 static void actionAppSwitcher(void) {
-    // SpringBoard's own handler for the "open app switcher" hardware-keyboard
-    // shortcut. Closest match to what we want and present across recent iOS
-    // releases. It ignores its sender, so nil is fine.
     id sb = [UIApplication sharedApplication];
     if ([sb respondsToSelector:@selector(_handleOpenAppSwitcherShortcut:)]) {
         [sb performSelector:@selector(_handleOpenAppSwitcherShortcut:) withObject:nil];
         return;
     }
-    // Older layouts kept the switcher on dedicated controllers.
     id sw = sharedOf("SBMainSwitcherViewController");
     if ([sw respondsToSelector:@selector(activateSwitcherNoninteractively)]) {
         [sw performSelector:@selector(activateSwitcherNoninteractively)];
@@ -800,13 +796,6 @@ static void actionAppSwitcher(void) {
     }
 }
 
-// "Back". Cmd+[ is the most reliable trigger: UIKit registers it as the
-// UINavigationController pop and WebKit/Safari as web-back, and it routes to the
-// focused foreground app like a real keyboard, so it works cross-process from
-// SpringBoard with no touch senderID (no first physical tap needed). Apps with a
-// fully custom navigation stack respond to neither this nor a swipe, which is the
-// realistic ceiling. We don't also fire an edge-swipe, which would double-back
-// wherever both are honored.
 static void actionBack(void) {
     cmdChord(0x2F); // Cmd+[
 }
@@ -821,6 +810,12 @@ void IOSPYSystemAction(uint16_t action) {
             case 8: actionBack(); break;
             default: NSLog(@"[ioscpyhook] unhandled system action %u", action); break;
         }
+    });
+}
+
+void IOSPYLaunchApp(NSString *bundleId) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        actionLaunchApp(bundleId);
     });
 }
 

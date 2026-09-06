@@ -307,6 +307,8 @@ pub enum SystemAction {
     RotateRight = 6,
     Screenshot = 7,
     Back = 8,
+    /// Payload may continue with UTF-8 bundle id after the u16.
+    LaunchApp = 9,
 }
 
 /// Encode an INPUT_TOUCH payload: `phase(u8) id(u8) x(f32 BE) y(f32 BE)`, with
@@ -323,6 +325,13 @@ pub fn encode_touch(phase: TouchPhase, id: u8, x: f32, y: f32) -> Vec<u8> {
 /// Encode a SYSTEM_ACTION payload: a single big-endian u16 action code.
 pub fn encode_system_action(action: SystemAction) -> Vec<u8> {
     (action as u16).to_be_bytes().to_vec()
+}
+
+/// Launch an app by bundle id (SYSTEM_ACTION 9 + UTF-8 bundle id).
+pub fn encode_launch_app(bundle_id: &str) -> Vec<u8> {
+    let mut v = (SystemAction::LaunchApp as u16).to_be_bytes().to_vec();
+    v.extend_from_slice(bundle_id.as_bytes());
+    v
 }
 
 /// A non-text key event (`INPUT_KEY` payload, one byte). Editing keys and the
