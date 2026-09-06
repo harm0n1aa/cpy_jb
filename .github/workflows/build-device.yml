@@ -65,6 +65,8 @@ jobs:
         env:
           THEOS: ${{ github.workspace }}/.theos-roothide
         run: |
+          # Windows checkouts often drop +x on maintainer scripts; dpkg rejects that.
+          chmod 755 layout/DEBIAN/postinst layout/DEBIAN/prerm 2>/dev/null || true
           # Override ARCHS on the CLI so local/QEMU Linux builds can stay arm64-only.
           # Pin SDK so "latest" does not pick a bare Xcode SDK without stubs.
           gmake clean || true
@@ -73,8 +75,7 @@ jobs:
             ARCHS="arm64 arm64e" \
             TARGET="iphone:clang:16.5:14.0"
           ls -la packages
-          lipo -info packages/.theos*/obj*/ioscpyhook.dylib 2>/dev/null || \
-            find .theos -name 'ioscpyhook.dylib' -print -exec lipo -info {} \;
+          find .theos -name 'ioscpyhook.dylib' -print -exec lipo -info {} \;
 
       - name: Verify arm64e slice in hook
         working-directory: ioscpy/device
